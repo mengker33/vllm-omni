@@ -411,7 +411,24 @@ class WanS2VTransformerBlock(nn.Module):
         # 6-way scale-shift modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        seq_lens=None,
+        grid_sizes=None,
+        freqs=None,
+        context=None,
+        context_lens=None,
+        e=None,
+    ):
+        x = hidden_states
+        if encoder_hidden_states is None:
+            encoder_hidden_states = e
+        if encoder_hidden_states is None:
+            raise ValueError("S2V transformer block requires modulation states.")
+
+        e = encoder_hidden_states
         seg_boundary = e[1]
         seg_idx = [0, min(max(0, seg_boundary), x.size(1)), x.size(1)]
         e = e[0]

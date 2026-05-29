@@ -83,6 +83,16 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def get_dummy_num_frames(model_class_name: str, supports_audio_io: bool) -> int:
+    """Return the dummy-run frame count for a pipeline warmup request."""
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is not None:
+        override = getattr(model_cls, "dummy_num_frames", None)
+        if override is not None:
+            return int(override)
+    return 2 if supports_audio_io else 1
+
+
 def get_extra_body_params(model_class_name: str) -> frozenset[str]:
     """Return the set of extra_body keys accepted by a pipeline.
 
@@ -691,10 +701,13 @@ class DiffusionEngine:
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
-        # Audio pipelines round audio token count from num_frames; the default
-        # of 1 yields seq_len=1 K/V which cuDNN SDPA refuses under torch.compile.
-        # 2 is the minimum that produces audio_num_frames > 1.
-        num_frames = 2 if supports_audio_input or supports_audio_output(self.od_config.model_class_name) else 1
+        # Audio pipelines need more than the image-model sentinel of 1 frame.
+        # Most only need 2 for valid audio token lengths, but some video+audio
+        # models require a larger warmup clip to keep latent temporal dims > 0.
+        num_frames = get_dummy_num_frames(
+            self.od_config.model_class_name,
+            supports_audio_input or supports_audio_output(self.od_config.model_class_name),
+        )
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_ids=["dummy_req_id"],
