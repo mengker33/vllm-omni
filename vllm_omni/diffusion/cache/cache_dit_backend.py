@@ -30,6 +30,13 @@ from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
 
 logger = init_logger(__name__)
 
+try:
+    from accelerate import hooks
+
+    _accelerate_is_availble = True
+except ImportError:
+    _accelerate_is_availble = False
+
 
 # Small helper to centralize cache-dit summaries.
 def cache_summary(pipeline: Any, details: bool = True) -> None:
@@ -1195,6 +1202,20 @@ class Wan22S2VCachedAdapter(CachedAdapter):
         transformer._context_manager = context_manager
         transformer._context_names = unique_blocks_name
 
+        if _accelerate_is_availble:
+            _hf_hook: Optional[hooks.ModelHook] = None
+            if getattr(transformer, "_hf_hook", None) is not None:
+                _hf_hook = transformer._hf_hook
+                if hasattr(transformer, "_old_forward"):
+                    logger.warning(
+                        "_hf_hook is not None, so, we have to re-direct transformer's "
+                        f"original_forward({id(original_forward)}) to transformer's "
+                        f"_old_forward({id(transformer._old_forward)})"
+                    )
+                    original_forward = transformer._old_forward
+        else:
+            _hf_hook = None
+
         if hasattr(transformer, "after_transformer_block"):
             transformer._cache_dit_original_after_transformer_block = transformer.after_transformer_block
 
@@ -1218,9 +1239,20 @@ class Wan22S2VCachedAdapter(CachedAdapter):
 
             return outputs
 
+        def new_forward_with_hf_hook(self, *args, **kwargs):
+            if _hf_hook is not None and hasattr(_hf_hook, "pre_forward"):
+                args, kwargs = _hf_hook.pre_forward(self, *args, **kwargs)
+
+            outputs = new_forward(self, *args, **kwargs)
+
+            if _hf_hook is not None and hasattr(_hf_hook, "post_forward"):
+                outputs = _hf_hook.post_forward(self, outputs)
+
+            return outputs
+
         transformer.forward = functools.update_wrapper(
-            functools.partial(new_forward, transformer),
-            new_forward,
+            functools.partial(new_forward_with_hf_hook, transformer),
+            new_forward_with_hf_hook,
         )
 
         transformer._original_forward = original_forward
