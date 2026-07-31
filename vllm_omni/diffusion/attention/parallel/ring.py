@@ -10,7 +10,12 @@ import torch
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
-from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_AITER, HAS_FA3, HAS_FLASH_ATTN
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import (
+    HAS_AITER,
+    HAS_FA3,
+    HAS_FLASH_ATTN,
+    HAS_SYCL_TLA,
+)
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
@@ -110,10 +115,23 @@ class RingParallelAttention:
         if backend_pref is not None:
             backend_pref = backend_pref.lower()
 
+        # On XPU, ring_degree alone selects the Level-Zero IPC path when the
+        # optional SYCL-TLA extensions are installed. Missing extensions keep
+        # the normal SDPA fallback below.
+        ring_world_size = self._sp_group.ring_group.size()
+        if (
+            query.device.type == "xpu"
+            and query.dtype == torch.bfloat16
+            and ring_world_size > 1
+            and HAS_SYCL_TLA
+            and not causal
+        ):
+            backend_pref = "xpu_ipc"
+
         # FP32 is not supported by Flash Attention, force SDPA
         if query.dtype == torch.float32:
             backend_pref = "sdpa"
-        elif not HAS_FA3 and not HAS_FLASH_ATTN and not HAS_AITER:
+        elif backend_pref != "xpu_ipc" and not HAS_FA3 and not HAS_FLASH_ATTN and not HAS_AITER:
             if backend_pref != "sdpa":
                 logger.warning_once("Flash Attention (FA2/FA3/AITER) is not available! Force enabling SDPA.")
             backend_pref = "sdpa"
@@ -126,6 +144,17 @@ class RingParallelAttention:
             joint_value = attn_metadata.joint_value
             if attn_metadata.joint_strategy is not None:
                 joint_strategy = attn_metadata.joint_strategy
+
+        # The current SYCL-TLA round kernel does not support joint K/V input.
+        if backend_pref == "xpu_ipc" and joint_key is not None:
+            backend_pref = "sdpa"
+
+        logger.warning_once(
+            "Ring parallel attention backend: %s (device=%s, ring_world_size=%d)",
+            backend_pref,
+            query.device,
+            ring_world_size,
+        )
 
         if backend_pref in {"sdpa", "torch", "torch_sdpa"}:
             from vllm_omni.diffusion.attention.backends.ring_pytorch_attn import ring_pytorch_attn_func
@@ -145,9 +174,16 @@ class RingParallelAttention:
 
         from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
 
+        # Preserve the XPU IPC selection.  Previously ``backend_pref`` could be
+        # set to ``xpu_ipc`` above, but this dispatch block ignored it and
+        # selected FA2/FA3/AITER instead.  That caused XPU runs without
+        # FlashAttention to enter ``flash_attn_forward`` and fail with
+        # ``FlashAttention is not available``.
+        if backend_pref == "xpu_ipc":
+            attn_type = AttnType.XPU_IPC
         # Prefer FA3 over FA2 for better performance (FA3 supports Ampere/Ada/Hopper)
         # On ROCm, use AITER
-        if HAS_FA3:
+        elif HAS_FA3:
             attn_type = AttnType.FA3
         elif HAS_AITER:
             attn_type = AttnType.AITER

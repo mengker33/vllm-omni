@@ -33,6 +33,7 @@ class AttnType(Enum):
     FA = "fa"
     FA3 = "fa3"
     FLASHINFER = "flashinfer"
+    XPU_IPC = "xpu_ipc"
     TORCH = "torch"
     SAGE_AUTO = "sage_auto"
     SAGE_FP16 = "sage_fp16"

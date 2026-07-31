@@ -49,6 +49,34 @@ flash3_attn_func = fa3_attn_func
 
 logger = logging.getLogger(__name__)
 
+# SYCL-TLA XPU IPC ring-attention extensions are optional. Keep imports
+# guarded so importing the ring backend remains safe on CUDA, CPU, and XPU
+# installations where the extensions have not been built.
+sycl_tla_fmha = None
+sycl_tla_ipc_p2p = None
+HAS_SYCL_TLA_FMHA = False
+HAS_SYCL_TLA_IPC = False
+
+try:
+    import sycl_tla_fmha  # noqa: F401
+
+    HAS_SYCL_TLA_FMHA = True
+except (ImportError, ModuleNotFoundError):
+    pass
+except Exception as e:
+    logger.warning("SYCL-TLA FMHA is unavailable; XPU ring attention is disabled. Reason: %s", e)
+
+try:
+    import sycl_tla_ipc_p2p  # noqa: F401
+
+    HAS_SYCL_TLA_IPC = True
+except (ImportError, ModuleNotFoundError):
+    pass
+except Exception as e:
+    logger.warning("SYCL-TLA IPC P2P is unavailable; XPU IPC ring attention is disabled. Reason: %s", e)
+
+HAS_SYCL_TLA = HAS_SYCL_TLA_FMHA and HAS_SYCL_TLA_IPC
+
 try:
     from flashinfer.prefill import single_prefill_with_kv_cache  # noqa: F401
 
