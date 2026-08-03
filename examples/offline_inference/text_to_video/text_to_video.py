@@ -372,13 +372,21 @@ def main():
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         enable_cpu_offload=args.enable_cpu_offload,
-        parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
+         # Pass diffusion parallelism as flat runtime overrides.
+        ulysses_degree=args.ulysses_degree,
+        ulysses_mode=args.ulysses_mode,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
