@@ -69,7 +69,24 @@ except Exception as e:
 try:
     import sycl_tla_ipc_p2p  # noqa: F401
 
-    HAS_SYCL_TLA_IPC = True
+    # Require the arena-based API introduced in commit 88164c1e of sycl-tla.
+    # Older builds only expose ipc_get_handle / ipc_open_handle / ipc_wait
+    # which have a use-after-free hazard; treat them as unavailable so the
+    # caller can surface a clear error rather than segfaulting.
+    _new_api = all(
+        hasattr(sycl_tla_ipc_p2p, name)
+        for name in ("make_arena", "open_peer", "copy_async", "shutdown")
+    )
+    if _new_api:
+        HAS_SYCL_TLA_IPC = True
+    else:
+        logger.warning(
+            "sycl_tla_ipc_p2p is present but lacks the arena-based API "
+            "(make_arena / open_peer / copy_async / shutdown). "
+            "Please rebuild the extension at or after commit "
+            "88164c1e98a5271068e5b16688850453cf1b70a2 of Wei-Lin-Intel/sycl-tla. "
+            "XPU IPC ring attention is disabled."
+        )
 except (ImportError, ModuleNotFoundError):
     pass
 except Exception as e:

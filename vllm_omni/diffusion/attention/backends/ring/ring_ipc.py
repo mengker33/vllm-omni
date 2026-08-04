@@ -5,12 +5,17 @@
 
 This module only owns peer-buffer setup and copy scheduling. The attention
 loop and its output/LSE accumulation are implemented by the caller.
+
+Requires sycl_tla_ipc_p2p built at or after commit
+88164c1e98a5271068e5b16688850453cf1b70a2 of Wei-Lin-Intel/sycl-tla
+(arena-based allocation with explicit lifetime management).
 """
 
 from __future__ import annotations
 
+import atexit
 import math
-from collections.abc import Iterable
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -24,6 +29,50 @@ from .ring_globals import (
 
 
 NUM_BUFFERS = 4
+
+# Process-lifetime cache: (pg_id, dev_index, k_shape, v_shape, dtype) -> IpcKVRing
+_ring_cache: dict[tuple[Any, ...], IpcKVRing] = {}
+_shutdown_registered = False
+
+
+def _check_new_api() -> None:
+    """Raise a clear error if the installed IPC module lacks the arena-based API."""
+    if ipc is None or not HAS_SYCL_TLA_IPC:
+        raise RuntimeError(
+            "SYCL-TLA IPC P2P is unavailable; install the "
+            "sycl_tla_ipc_p2p extension or use the PyTorch ring backend"
+        )
+    missing = [
+        name
+        for name in ("make_arena", "open_peer", "copy_async", "shutdown")
+        if not hasattr(ipc, name)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"sycl_tla_ipc_p2p is missing arena-based API symbols: {missing}. "
+            "Please rebuild the extension at or after commit "
+            "88164c1e98a5271068e5b16688850453cf1b70a2 of Wei-Lin-Intel/sycl-tla."
+        )
+
+
+def _register_shutdown() -> None:
+    global _shutdown_registered
+    if _shutdown_registered:
+        return
+    _shutdown_registered = True
+
+    def _shutdown() -> None:
+        if ipc is not None and hasattr(ipc, "shutdown"):
+            try:
+                ipc.shutdown()
+            except Exception:
+                pass
+
+    atexit.register(_shutdown)
+
+
+def align_up(n: int, align: int) -> int:
+    return (n + align - 1) & ~(align - 1)
 
 
 def read_slot_of(step: int) -> int:
@@ -56,12 +105,13 @@ def current_queue_ptr(device: torch.device) -> int:
 
 
 class IpcKVRing:
-    """Persistent local K/V buffers and peer IPC mappings for one ring group.
+    """Persistent arena-based K/V buffers and peer IPC mappings for one ring group.
 
-    Buffer zero permanently contains the rank's original local block. The
-    other buffers are rotating copy destinations. Handles are gathered in
-    process-group local-rank order, so subgroup global-rank numbering does not
-    affect peer selection.
+    Slot zero permanently contains the rank's own block for the current
+    attention pass (refreshed via ``stage``). The other slots are rotating
+    copy destinations. Handles are exchanged once at construction via
+    ``dist.all_gather_object`` so that no IPC handle is created or destroyed
+    per attention layer.
     """
 
     def __init__(
@@ -69,14 +119,9 @@ class IpcKVRing:
         k_local: torch.Tensor,
         v_local: torch.Tensor,
         process_group: dist.ProcessGroup | None = None,
-        queue_ptr: int | None = None,
     ) -> None:
-        if not HAS_SYCL_TLA_IPC or ipc is None:
-            raise RuntimeError(
-                "SYCL-TLA IPC P2P is unavailable; install the "
-                "sycl_tla_ipc_p2p extension or use the PyTorch ring backend"
-            )
-        if not hasattr(torch, "xpu") or not k_local.device.type == "xpu":
+        _check_new_api()
+        if not hasattr(torch, "xpu") or k_local.device.type != "xpu":
             raise RuntimeError("IpcKVRing requires tensors on an Intel XPU")
         if k_local.device != v_local.device:
             raise ValueError("K and V must be on the same XPU device")
@@ -89,101 +134,119 @@ class IpcKVRing:
         if self.world_size < 2:
             raise ValueError("IpcKVRing requires at least two ranks")
         self.prev_rank = (self.rank - 1) % self.world_size
-        self.queue_ptr = current_queue_ptr(k_local.device) if queue_ptr is None else queue_ptr
 
-        # Keep slot zero as an owned, fixed allocation. ``copy_`` writes into
-        # this allocation and does not replace its storage, which is required
-        # because the IPC mappings use these buffers as their local context.
-        self.kbuf = [torch.empty_like(k_local)]
-        self.vbuf = [torch.empty_like(v_local)]
-        self.kbuf[0].copy_(k_local)
-        self.vbuf[0].copy_(v_local)
-        for _ in range(NUM_BUFFERS - 1):
-            self.kbuf.append(torch.empty_like(k_local))
-            self.vbuf.append(torch.empty_like(v_local))
+        # Capture the queue pointer once at construction and reuse it for every
+        # subsequent IPC call. env_for_device hard-errors if a device is used
+        # with a different sycl::queue than the one it was initialized with.
+        self.queue_ptr = current_queue_ptr(k_local.device)
+        self.device = k_local.device
+        self.dev_index = k_local.device.index or 0
 
-        self.k_nbytes = self.kbuf[0].numel() * self.kbuf[0].element_size()
-        self.v_nbytes = self.vbuf[0].numel() * self.vbuf[0].element_size()
+        # ── Arena layout ──────────────────────────────────────────────────────
+        # slot_i = [K_i (k_nbytes)] [padding] [V_i (v_nbytes)] [padding]
+        # Offsets within a slot are aligned to 4096B (page / IPC alignment).
+        # The arena base must be 256B-aligned (IpcArena.view requirement).
+        k_nbytes = k_local.numel() * k_local.element_size()
+        v_nbytes = v_local.numel() * v_local.element_size()
+        self.k_nbytes = k_nbytes
+        self.v_nbytes = v_nbytes
 
-        local_handles = {
-            "k": [ipc.ipc_get_handle(buf, self.queue_ptr) for buf in self.kbuf],
-            "v": [ipc.ipc_get_handle(buf, self.queue_ptr) for buf in self.vbuf],
-        }
-        gathered: list[dict[str, list[tuple[bytes, int]]]] = [None] * self.world_size  # type: ignore[list-item]
-        dist.all_gather_object(gathered, local_handles, group=process_group)
-        peer = gathered[self.prev_rank]
+        self.k_off_in_slot = 0
+        self.v_off_in_slot = align_up(k_nbytes, 4096)
+        self.slot_stride = align_up(self.v_off_in_slot + v_nbytes, 4096)
+        total_bytes = self.slot_stride * NUM_BUFFERS
 
-        self.k_peer_off = [int(offset) for _, offset in peer["k"]]
-        self.v_peer_off = [int(offset) for _, offset in peer["v"]]
-        self.k_peer_ptr = [
-            ipc.ipc_open_handle(self.kbuf[0], handle, int(offset), self.queue_ptr)
-            for handle, offset in peer["k"]
-        ]
-        self.v_peer_ptr = [
-            ipc.ipc_open_handle(self.vbuf[0], handle, int(offset), self.queue_ptr)
-            for handle, offset in peer["v"]
-        ]
+        self.arena = ipc.make_arena(self.dev_index, total_bytes, self.queue_ptr)
 
-        # Do not issue a copy until every rank has opened its previous peer.
-        dist.barrier()
-        torch.xpu.synchronize()
+        # Non-owning tensor views into the arena, one per slot for K and V.
+        self.kbuf: list[torch.Tensor] = []
+        self.vbuf: list[torch.Tensor] = []
+        for i in range(NUM_BUFFERS):
+            slot_base = i * self.slot_stride
+            self.kbuf.append(
+                self.arena.view(slot_base + self.k_off_in_slot, k_local.shape, k_local.dtype)
+            )
+            self.vbuf.append(
+                self.arena.view(slot_base + self.v_off_in_slot, v_local.shape, v_local.dtype)
+            )
 
+        # ── One-time handle exchange ───────────────────────────────────────────
+        local_handle = self.arena.export_handle()
+        gathered: list[Any] = [None] * self.world_size
+        dist.all_gather_object(gathered, local_handle, group=process_group)
+        peer_handle = gathered[self.prev_rank]
 
-    def copy_next(self, step: int) -> list[int]:
-        """Copy the previous rank's block for ``step + 1`` asynchronously."""
+        self.peer_base: int = ipc.open_peer(self.dev_index, peer_handle, self.queue_ptr)
+
+        # Peer slot K/V raw pointers are just peer_base + slot offset.
+        self.k_peer_ptr: list[int] = []
+        self.v_peer_ptr: list[int] = []
+        for i in range(NUM_BUFFERS):
+            slot_base = i * self.slot_stride
+            self.k_peer_ptr.append(self.peer_base + slot_base + self.k_off_in_slot)
+            self.v_peer_ptr.append(self.peer_base + slot_base + self.v_off_in_slot)
+
+        # Wait for every rank to have opened its peer before any DMA.
+        dist.barrier(group=process_group)
+        torch.xpu.synchronize(self.device)
+
+    def stage(self, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
+        """Copy fresh per-layer K/V tensors into slot 0 of the arena."""
+        self.kbuf[0].copy_(k_new)
+        self.vbuf[0].copy_(v_new)
+        # copy_ is enqueued on the compute queue; the copy engine cannot see it
+        # until the compute queue drains. Synchronize so peers can safely DMA
+        # from slot 0.
+        torch.xpu.current_stream(self.device).synchronize()
+
+    def copy_next(self, step: int) -> list[Any]:
+        """Copy the previous rank's block for ``step + 1`` asynchronously.
+
+        Returns a list of ``PendingCopy`` objects that must be waited before
+        the destination slot is read.
+        """
         if step >= self.world_size - 1:
             return []
 
-        # The copy engine is independent from PyTorch's compute queue. A
-        # barrier only synchronizes the host processes and does not establish
-        # a device dependency, so a later round could otherwise overwrite a
-        # rotating slot while an earlier FMHA kernel is still reading it (and
-        # a peer could read that slot at the same time). Synchronizing before
-        # the next DMA makes slot reuse and peer-source ordering explicit while
-        # retaining overlap with the FMHA kernel launched for this round.
-        torch.xpu.synchronize()
-
         read_slot = read_slot_of(step)
         write_slot = write_slot_of(step)
-        return [
-            ipc.ipc_copy_from_peer_async(
-                self.kbuf[write_slot],
+        arena_base = self.arena.base_ptr()
+        pending = [
+            ipc.copy_async(
+                self.dev_index,
+                arena_base + write_slot * self.slot_stride + self.k_off_in_slot,
                 self.k_peer_ptr[read_slot],
                 self.k_nbytes,
                 self.queue_ptr,
             ),
-            ipc.ipc_copy_from_peer_async(
-                self.vbuf[write_slot],
+            ipc.copy_async(
+                self.dev_index,
+                arena_base + write_slot * self.slot_stride + self.v_off_in_slot,
                 self.v_peer_ptr[read_slot],
                 self.v_nbytes,
                 self.queue_ptr,
             ),
         ]
+        return pending
 
-    @staticmethod
-    def wait(handles: Iterable[int]) -> None:
-        """Wait for and release all pending copy-engine operations."""
-        if ipc is None:
-            raise RuntimeError("SYCL-TLA IPC P2P is unavailable")
-        for handle in handles:
-            ipc.ipc_wait(handle)
 
-    def close(self) -> None:
-        """Close peer mappings after all copy operations have completed."""
-        if ipc is None:
-            return
-        for peer_ptr, offset in zip(self.k_peer_ptr, self.k_peer_off):
-            try:
-                ipc.ipc_close_handle(self.kbuf[0], peer_ptr, offset, self.queue_ptr)
-            except Exception:
-                pass
-        for peer_ptr, offset in zip(self.v_peer_ptr, self.v_peer_off):
-            try:
-                ipc.ipc_close_handle(self.vbuf[0], peer_ptr, offset, self.queue_ptr)
-            except Exception:
-                pass
-        self.k_peer_ptr = []
-        self.v_peer_ptr = []
+def _get_or_create_ring(
+    process_group: dist.ProcessGroup | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> IpcKVRing:
+    """Return a cached ``IpcKVRing`` for this (group, device, shape, dtype) key."""
+    global _ring_cache
+    pg_id = id(process_group)
+    dev_index = k.device.index or 0
+    cache_key = (pg_id, dev_index, tuple(k.shape), tuple(v.shape), k.dtype)
+
+    ring = _ring_cache.get(cache_key)
+    if ring is None:
+        _register_shutdown()
+        ring = IpcKVRing(k, v, process_group=process_group)
+        _ring_cache[cache_key] = ring
+    return ring
 
 
 @torch.compiler.disable
@@ -252,7 +315,12 @@ def ring_ipc_attn_forward(
     if softmax_scale is not None and not math.isclose(softmax_scale, default_scale, rel_tol=1e-6):
         raise NotImplementedError("SYCL-TLA IPC ring attention only supports the default softmax scale")
 
-    ring = IpcKVRing(k, v, process_group=process_group)
+    ring = _get_or_create_ring(process_group, k, v)
+
+    # Stage the freshly produced per-layer K/V into slot 0 of the arena and
+    # synchronize so peers can safely DMA from it.
+    ring.stage(k, v)
+
     out = torch.empty(
         (q.shape[0], q.shape[1], q.shape[2], v.shape[3]),
         device=q.device,
@@ -264,29 +332,22 @@ def ring_ipc_attn_forward(
         dtype=torch.float32,
     )
 
-    try:
-        for step in range(ring.world_size):
-            pending = ring.copy_next(step)
-            read_slot = read_slot_of(step)
-            fa.prefill_bf16_bshd_kv_round(
-                q=q,
-                k=ring.kbuf[read_slot],
-                v=ring.vbuf[read_slot],
-                out=out,
-                lse=lse,
-                round_idx=step,
-            )
+    for step in range(ring.world_size):
+        pending = ring.copy_next(step)
+        read_slot = read_slot_of(step)
+        fa.prefill_bf16_bshd_kv_round(
+            q=q,
+            k=ring.kbuf[read_slot],
+            v=ring.vbuf[read_slot],
+            out=out,
+            lse=lse,
+            round_idx=step,
+        )
 
-            ring.wait(pending)
+        for h in pending:
+            h.wait()
 
-            if step < ring.world_size - 1:
-                dist.barrier()
-
-        # Keep all ranks aligned before the mappings are closed and before a
-        # subsequent ring pass can reuse the rotating buffers.
-        dist.barrier()
-        torch.xpu.synchronize()
-    finally:
-        ring.close()
+    # Align all ranks before the next call can overwrite slot 0 via stage().
+    dist.barrier(group=process_group)
 
     return out, lse.transpose(1, 2).contiguous()
