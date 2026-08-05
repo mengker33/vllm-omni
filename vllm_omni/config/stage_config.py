@@ -64,12 +64,16 @@ def build_stage_runtime_overrides(
     if internal_keys is None:
         from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
-        # Some fields are modeled as orchestrator-owned for top-level CLI
-        # parsing, but are also legitimate deploy-time stage overrides. Keep
-        # the default blacklist for true orchestrator/shared fields while
-        # allowing any field explicitly represented by the deploy schema to
-        # continue flowing into per-stage overrides.
-        internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
+        # ``parallel_config`` is a pre-built DiffusionParallelConfig passed
+        # programmatically via ``Omni(parallel_config=...)``. It is declared on
+        # OrchestratorArgs for top-level parsing, but is not a StageDeployConfig
+        # field, so the blacklist would otherwise drop it before it reaches the
+        # diffusion stage. Diffusion stages consume it in
+        # ``_apply_diffusion_parallel_runtime_overrides``; non-diffusion stages
+        # drop it there so it never leaks into AR engine args.
+        internal_keys = (
+            (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys() - {"parallel_config"}
+        )
 
     result: dict[str, Any] = {}
 
@@ -142,6 +146,29 @@ def _apply_diffusion_parallel_runtime_overrides(
     parallel_config_dict = dict(parallel_config) if parallel_config is not None else None
     degree_overridden = False
     sequence_parallel_explicit = runtime_overrides.get("sequence_parallel_size") is not None
+
+    # A caller-supplied ``parallel_config`` object/mapping is a whole-config
+    # override: merge it over the YAML defaults first so that individual flat
+    # overrides (``tensor_parallel_size=...``) still take precedence below.
+    # Popped so the generic override loop in ``to_omegaconf`` cannot re-assign
+    # the raw object on top of the merged dict.
+    override_pc = runtime_overrides.pop("parallel_config", None)
+    if override_pc is not None:
+        if dataclasses.is_dataclass(override_pc) and not isinstance(override_pc, type):
+            override_pc = asdict(override_pc)
+        elif not isinstance(override_pc, dict) and hasattr(override_pc, "__dict__"):
+            override_pc = dict(vars(override_pc))
+        if isinstance(override_pc, dict):
+            override_pc = {k: v for k, v in override_pc.items() if k in parallel_fields and v is not None}
+            if override_pc:
+                parallel_config_dict = {**(parallel_config_dict or {}), **override_pc}
+            if any(k in override_pc for k in ("ulysses_degree", "ring_degree", "allgather_degree")):
+                degree_overridden = True
+        else:
+            logger.warning(
+                "Ignoring parallel_config override of unsupported type %r",
+                type(override_pc).__name__,
+            )
 
     for key in list(runtime_overrides.keys()):
         value = runtime_overrides.get(key)
