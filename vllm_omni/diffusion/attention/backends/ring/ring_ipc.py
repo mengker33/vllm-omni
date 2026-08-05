@@ -211,11 +211,11 @@ def _get_cached_ring(
         _IPC_RING_CACHE[key] = ring
     else:
         ring.stage(k, v)
-
     # Synchronize staging across ranks before the first copy engine transfer.
     # The reference implementation keeps this synchronization at the ring
     # pass boundary rather than inserting barriers between rounds.
     dist.barrier(group=process_group)
+
     return ring
 
 
@@ -310,9 +310,9 @@ def ring_ipc_attn_forward(
 
         ring.wait(pending)
 
-        # if step < ring.world_size - 1:
-        #     # Synchronize before the next copy engine transfer.
-        #     dist.barrier(group=process_group)
+        if step < ring.world_size - 1 and k.shape[1] <= 4096:
+        # Synchronize before the next copy engine transfer for small sequence lengths.
+            dist.barrier(group=process_group)
 
     torch.xpu.synchronize()
 
