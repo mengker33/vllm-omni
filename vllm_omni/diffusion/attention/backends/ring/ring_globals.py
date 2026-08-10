@@ -100,3 +100,12 @@ try:
     HAS_NPU = True
 except (ImportError, ModuleNotFoundError):
     HAS_NPU = False
+
+# XAttention provides the SYCL-TLA ring implementation for Intel XPU. Keep
+# this optional so CUDA/CPU installations do not require the extension.
+try:
+    from xattention import ring_attn_ipc_forward  # noqa: F401
+
+    HAS_SYCL_TLA = True
+except (ImportError, ModuleNotFoundError):
+    HAS_SYCL_TLA = False

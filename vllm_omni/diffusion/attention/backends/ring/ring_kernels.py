@@ -12,9 +12,13 @@ from .ring_globals import (
     HAS_FA4,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
+    HAS_SYCL_TLA,
     fa3_fwd_func,
     fa4_attn_func,
 )
+
+if HAS_SYCL_TLA:
+    from xattention import ring_attn_ipc_forward
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
 _scaled_dot_product_efficient_attention = torch.ops.aten._scaled_dot_product_efficient_attention
@@ -38,6 +42,43 @@ if HAS_FLASHINFER:
     from flashinfer.prefill import single_prefill_with_kv_cache
 
     _LOG2_E = math.log2(math.e)
+
+
+def xattention_ring_attn_forward(
+    process_group,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    joint_tensor_key=None,
+    joint_tensor_value=None,
+    joint_strategy="front",
+):
+    """Run XAttention's SYCL-TLA IPC ring kernel on Intel XPU."""
+    if not HAS_SYCL_TLA:
+        raise RuntimeError("XAttention is required for the XPU IPC ring backend")
+
+    return ring_attn_ipc_forward(
+        process_group=process_group,
+        q=q.contiguous(),
+        k=k.contiguous(),
+        v=v.contiguous(),
+        softmax_scale=softmax_scale,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        joint_tensor_key=joint_tensor_key,
+        joint_tensor_value=joint_tensor_value,
+        joint_strategy=joint_strategy,
+        return_softmax_lse=True,
+    )
 
 
 def pytorch_attn_forward(

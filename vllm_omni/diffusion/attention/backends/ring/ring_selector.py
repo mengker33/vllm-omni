@@ -42,6 +42,7 @@ class AttnType(Enum):
     SAGE_FP8 = "sage_fp8"
     SAGE_FP8_SM90 = "sage_fp8_sm90"
     SPARSE_SAGE = "sparse_sage"
+    XPU_IPC = "xpu_ipc"
 
     @classmethod
     def from_string(cls, s: str):

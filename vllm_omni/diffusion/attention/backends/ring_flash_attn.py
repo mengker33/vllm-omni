@@ -5,9 +5,16 @@
 
 import torch
 
+from vllm.logger import init_logger
+
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_SYCL_TLA
+from vllm_omni.diffusion.attention.backends.ring.ring_kernels import xattention_ring_attn_forward
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType, select_flash_attn_impl
 from vllm_omni.diffusion.attention.backends.ring.ring_utils import update_out_and_lse
 from vllm_omni.diffusion.distributed.comm import RingComm
+
+
+logger = init_logger(__name__)
 
 
 def ring_flash_attn_forward(
@@ -28,6 +35,28 @@ def ring_flash_attn_forward(
     joint_tensor_value=None,
     joint_strategy="front",
 ):
+    if attn_type == AttnType.XPU_IPC:
+        if HAS_SYCL_TLA and q.device.type == "xpu":
+            logger.warning_once("Using XAttention SYCL-TLA IPC ring attention on %s", q.device)
+            return xattention_ring_attn_forward(
+                process_group=process_group,
+                q=q,
+                k=k,
+                v=v,
+                softmax_scale=softmax_scale,
+                dropout_p=dropout_p,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                alibi_slopes=alibi_slopes,
+                joint_tensor_key=joint_tensor_key,
+                joint_tensor_value=joint_tensor_value,
+                joint_strategy=joint_strategy,
+            )
+
+        logger.warning_once("XAttention IPC ring requested outside an available XPU; falling back to SDPA")
+        attn_type = AttnType.TORCH
+
     # Validate causal + joint_strategy combination
     # When causal=True and joint_strategy="rear", the causal mask would incorrectly
     # prevent local query tokens from attending to joint key tokens (which are

@@ -10,7 +10,13 @@ import torch
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
-from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_AITER, HAS_FA3, HAS_FA4, HAS_FLASH_ATTN
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import (
+    HAS_AITER,
+    HAS_FA3,
+    HAS_FA4,
+    HAS_FLASH_ATTN,
+    HAS_SYCL_TLA,
+)
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
@@ -105,6 +111,30 @@ class RingParallelAttention:
         """Run the actual Ring Attention kernel."""
         if softmax_scale is None:
             softmax_scale = query.shape[-1] ** -0.5
+
+        if query.device.type == "xpu" and HAS_SYCL_TLA:
+            from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
+
+            joint_key, joint_value = None, None
+            joint_strategy = "front"
+            if attn_metadata is not None:
+                joint_key = attn_metadata.joint_key
+                joint_value = attn_metadata.joint_value
+                if attn_metadata.joint_strategy is not None:
+                    joint_strategy = attn_metadata.joint_strategy
+
+            return ring_flash_attn_func(
+                query,
+                key,
+                value,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                group=self._sp_group.ring_group,
+                attn_type=AttnType.XPU_IPC,
+                joint_tensor_key=joint_key,
+                joint_tensor_value=joint_value,
+                joint_strategy=joint_strategy,
+            )
 
         backend_pref = self.attn_backend_pref
         if backend_pref is not None:
