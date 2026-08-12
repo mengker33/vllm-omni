@@ -58,6 +58,7 @@ def xattention_ring_attn_forward(
     joint_tensor_key=None,
     joint_tensor_value=None,
     joint_strategy="front",
+    valid_kv_lens=None,
 ):
     """Run XAttention's SYCL-TLA IPC ring kernel on Intel XPU."""
     if not HAS_SYCL_TLA:
@@ -77,7 +78,7 @@ def xattention_ring_attn_forward(
         joint_tensor_key=joint_tensor_key,
         joint_tensor_value=joint_tensor_value,
         joint_strategy=joint_strategy,
-        return_softmax_lse=True,
+        valid_kv_lens=valid_kv_lens,
     )
 
 

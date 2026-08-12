@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
@@ -28,6 +29,16 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
 logger = init_logger(__name__)
+
+
+def _valid_kv_lens_from_padding(orig_seq_len: int, block_len: int, world: int) -> list[int]:
+    """Per-rank valid K/V lengths under SP right-aligned auto-padding.
+
+    Rank r owns global positions [r*block_len, (r+1)*block_len); padding is
+    appended at the end, so only the trailing rank(s) are short. Derived
+    locally on every rank -- no collective required.
+    """
+    return [max(0, min(orig_seq_len - r * block_len, block_len)) for r in range(world)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +125,11 @@ class RingParallelAttention:
 
         if query.device.type == "xpu" and HAS_SYCL_TLA:
             from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
+            from vllm_omni.diffusion.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+            from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_rank
 
             joint_key, joint_value = None, None
             joint_strategy = "front"
@@ -123,6 +139,25 @@ class RingParallelAttention:
                 if attn_metadata.joint_strategy is not None:
                     joint_strategy = attn_metadata.joint_strategy
 
+            valid_kv_lens = None
+            if is_forward_context_available():
+                forward_ctx = get_forward_context()
+                if (
+                    forward_ctx.sp_original_seq_len is not None
+                    and forward_ctx.sp_padding_size > 0
+                ):
+                    ring_world_size = dist.get_world_size(self._sp_group.ring_group)
+                    valid_kv_lens = _valid_kv_lens_from_padding(
+                        forward_ctx.sp_original_seq_len,
+                        key.shape[1],
+                        ring_world_size,
+                    )
+                    local_valid_kv_len = valid_kv_lens[get_sequence_parallel_rank()]
+                    if local_valid_kv_len == 0:
+                        raise ValueError(
+                            "XAttention ring attention does not support an empty local K/V shard; "
+                            "sequence length must be at least the sequence-parallel size."
+                        )
             return ring_flash_attn_func(
                 query,
                 key,
@@ -134,6 +169,7 @@ class RingParallelAttention:
                 joint_tensor_key=joint_key,
                 joint_tensor_value=joint_value,
                 joint_strategy=joint_strategy,
+                valid_kv_lens=valid_kv_lens,
             )
 
         backend_pref = self.attn_backend_pref

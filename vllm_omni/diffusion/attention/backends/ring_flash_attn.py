@@ -34,6 +34,7 @@ def ring_flash_attn_forward(
     joint_tensor_key=None,
     joint_tensor_value=None,
     joint_strategy="front",
+    valid_kv_lens=None,
 ):
     if attn_type == AttnType.XPU_IPC:
         if HAS_SYCL_TLA and q.device.type == "xpu":
@@ -52,6 +53,7 @@ def ring_flash_attn_forward(
                 joint_tensor_key=joint_tensor_key,
                 joint_tensor_value=joint_tensor_value,
                 joint_strategy=joint_strategy,
+                valid_kv_lens=valid_kv_lens,
             )
 
         logger.warning_once("XAttention IPC ring requested outside an available XPU; falling back to SDPA")
@@ -160,6 +162,7 @@ class RingFlashAttnFunc(torch.autograd.Function):
         joint_tensor_key=None,
         joint_tensor_value=None,
         joint_strategy="front",
+        valid_kv_lens=None,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -186,6 +189,7 @@ class RingFlashAttnFunc(torch.autograd.Function):
             joint_tensor_key=joint_tensor_key,
             joint_tensor_value=joint_tensor_value,
             joint_strategy=joint_strategy,
+            valid_kv_lens=valid_kv_lens,
         )
         return out if not return_softmax else (out, softmax_lse, None)
 
@@ -221,6 +225,7 @@ def ring_flash_attn_qkvpacked_func(
         None,  # joint_tensor_key
         None,  # joint_tensor_value
         "front",  # joint_strategy
+        None,  # valid_kv_lens
     )
 
 
@@ -256,6 +261,7 @@ def ring_flash_attn_kvpacked_func(
         None,  # joint_tensor_key
         None,  # joint_tensor_value
         "front",  # joint_strategy
+        None,  # valid_kv_lens
     )
 
 
@@ -277,6 +283,7 @@ def ring_flash_attn_func(
     joint_tensor_key=None,
     joint_tensor_value=None,
     joint_strategy="front",
+    valid_kv_lens=None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, None]:
     """Ring Attention forward pass using Flash Attention backend.
 
@@ -301,7 +308,8 @@ def ring_flash_attn_func(
         alibi_slopes (torch.Tensor | None): ALiBi slopes for positional bias.
             Not supported.
         deterministic (bool): Whether to use deterministic algorithms.
-            Defaults to False.
+        valid_kv_lens (list[int] | None): Per-rank valid K/V lengths for padded
+            sequence-parallel inputs.
         return_attn_probs (bool): If True, returns (out, softmax_lse, None).
             Defaults to False.
         group (ProcessGroup | None): Process group for ring communication.
@@ -342,4 +350,5 @@ def ring_flash_attn_func(
         joint_tensor_key,
         joint_tensor_value,
         joint_strategy,
+        valid_kv_lens,
     )

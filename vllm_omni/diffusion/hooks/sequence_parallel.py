@@ -333,7 +333,7 @@ class SequenceParallelSplitHook(ModelHook):
             if self.config.ulysses_degree > 1:
                 suggestions.append("set parallel_config.ulysses_mode='advanced_uaa' (UAA)")
             suggestions.append(
-                "enable auto_pad=True in the model _sp_plan (requires attention_mask support and ring_degree=1)"
+                "enable auto_pad=True in the model _sp_plan (requires attention_mask support, unless using valid-length Ring attention)"
             )
             suggestions.append("choose seq_len divisible by sequence_parallel_size (or adjust SP degrees)")
             msg += "Try: " + "; ".join(suggestions) + "."
@@ -379,10 +379,11 @@ class SequenceParallelSplitHook(ModelHook):
 
         When sequence length is not divisible by SP world size, this method:
         1. Pads the tensor to make it divisible
-        2. Creates an attention mask indicating valid vs padding positions
+        2. Records valid-vs-padding metadata for attention implementations
         3. Stores the mask and padding info in ForwardContext
         """
         from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
+        from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_SYCL_TLA
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_ring_parallel_world_size,
             get_sequence_parallel_rank,
@@ -401,6 +402,11 @@ class SequenceParallelSplitHook(ModelHook):
             # No padding needed
             return sp_shard(x, dim, validate=False)
 
+        # Ring attention handles padding through per-rank valid K/V lengths rather
+        # than an attention mask. Other backends still require mask support.
+        ring_attention = get_ring_parallel_world_size() > 1
+        supports_padded_ring = ring_attention and x.device.type == "xpu" and HAS_SYCL_TLA
+
         # Check backend compatibility
         attention_config = None
         if is_forward_context_available():
@@ -413,19 +419,16 @@ class SequenceParallelSplitHook(ModelHook):
             head_size=-1,
             attention_config=attention_config,
         )
-        if not attn_backend.supports_attention_mask:
+        if not supports_padded_ring and not attn_backend.supports_attention_mask:
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
                 f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
                 f"Please switch to SDPA or Ascend attention backend."
             )
-
-        # Ring attention does not support attention_mask
-        if get_ring_parallel_world_size() > 1:
+        if ring_attention and not supports_padded_ring:
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
-                f"Cannot use Ring attention which does not support attention_mask. "
-                f"Please switch to Ulysses SP only."
+                "Padded Ring attention requires the XPU XAttention backend with valid K/V lengths."
             )
 
         # Calculate padding

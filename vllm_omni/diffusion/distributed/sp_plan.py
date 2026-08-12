@@ -222,8 +222,8 @@ class SequenceParallelInput:
         auto_pad: If True, automatically pad the tensor if its size along split_dim
             is not divisible by world_size. Creates an attention mask to indicate
             valid vs padding positions. The mask is stored in ForwardContext.
-            Note: Ring attention does not support attention mask, so auto_pad
-            should only be used with Ulysses SP.
+            Note: Ring attention uses per-rank valid K/V lengths instead of an
+            attention mask when its backend supports padded sequence lengths.
 
     Example:
         # Split hidden_states along sequence dimension (dim 1)
