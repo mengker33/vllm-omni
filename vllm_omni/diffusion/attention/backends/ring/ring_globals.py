@@ -104,7 +104,7 @@ except (ImportError, ModuleNotFoundError):
 # XAttention provides the SYCL-TLA ring implementation for Intel XPU. Keep
 # this optional so CUDA/CPU installations do not require the extension.
 try:
-    from xattention import ring_attn_ipc_forward  # noqa: F401
+    from deepklox import ring_attn_ipc_forward  # noqa: F401
 
     HAS_SYCL_TLA = True
 except (ImportError, ModuleNotFoundError):

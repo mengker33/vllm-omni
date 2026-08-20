@@ -18,7 +18,7 @@ from .ring_globals import (
 )
 
 if HAS_SYCL_TLA:
-    from xattention import ring_attn_ipc_forward
+    from deepklox import ring_attn_ipc_forward
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
 _scaled_dot_product_efficient_attention = torch.ops.aten._scaled_dot_product_efficient_attention
