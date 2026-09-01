@@ -319,6 +319,24 @@ def parse_args() -> argparse.Namespace:
         choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
         help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
     )
+    parser.add_argument(
+        "--diffusion-kv-cache-dtype",
+        type=str,
+        default=None,
+        help="Diffusion attention KV cache dtype (e.g. fp8). Separate from vLLM --kv-cache-dtype.",
+    )
+    parser.add_argument(
+        "--diffusion-kv-cache-skip-steps",
+        type=str,
+        default=None,
+        help="Diffusion KV-cache quantization skip-step selector, e.g. '0-9,20,25-30'.",
+    )
+    parser.add_argument(
+        "--diffusion-kv-cache-skip-layers",
+        type=str,
+        default=None,
+        help="Diffusion KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
+    )
 
     # Distributed and parallel execution
     parser.add_argument(
@@ -468,6 +486,9 @@ def main():
         enable_layerwise_offload=args.enable_layerwise_offload,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
+        diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
+        diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
+        diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
         enable_cpu_offload=args.enable_cpu_offload,
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
@@ -528,6 +549,7 @@ def main():
         f" vae_patch_parallel_size={args.vae_patch_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size},"
         f" enable_expert_parallel={args.enable_expert_parallel}"
     )
+    print(f"  diffusion_kv_cache_dtype(config): {args.diffusion_kv_cache_dtype}")
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 

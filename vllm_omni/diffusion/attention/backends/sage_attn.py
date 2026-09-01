@@ -11,6 +11,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+from vllm_omni.diffusion.profiler.device_op_timer import device_op_timer
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -22,6 +23,17 @@ assert _SAGE_ATTN_TENSOR_LAYOUT in ("NHD", "HND"), (
 
 if current_omni_platform.is_xpu():
     try:
+        from deepklox import sageattn as deepklox_sageattn
+
+        _deepklox_sageattn_precision = os.environ.get("DEEPKLOX_SAGE_ATTN_PRECISION", "fp8")
+        logger.info_once(
+            "Using DeepKlox SageAttention on XPU with precision=%s and tensor_layout=NHD",
+            _deepklox_sageattn_precision,
+        )
+    except ImportError:
+        deepklox_sageattn = None
+        _deepklox_sageattn_precision = "fp8"
+    try:
         import inspect
 
         from auto_round_kernel import ARK
@@ -32,10 +44,8 @@ if current_omni_platform.is_xpu():
         _sagev1_has_tensor_layout = "tensor_layout" in _sagev1_params
         _sagev1_scale_param = "sm_scale" if "sm_scale" in _sagev1_params else "scale"
     except ImportError:
-        logger.warning(
-            "XPU SageAttention (auto_round_kernel.ARK.sagev1) is not available. "
-            "Install auto-round-lib for XPU sage attention support."
-        )
+        if deepklox_sageattn is None:
+            logger.warning("XPU SageAttention is not available. Install deepklox or auto-round-lib.")
         xpu_sageattn = None
         _sagev1_has_tensor_layout = False
         _sagev1_scale_param = "scale"
@@ -69,6 +79,12 @@ class SageAttentionBackend(AttentionBackend):
 
 
 class SageAttentionImpl(AttentionImpl):
+    @staticmethod
+    def _canonical_nhd(tensor: torch.Tensor) -> torch.Tensor:
+        """Copy an NHD tensor into strides required by DeepKlox."""
+        canonical = torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
+        return canonical.copy_(tensor)
+
     def __init__(
         self,
         num_heads: int,
@@ -109,40 +125,63 @@ class SageAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
+        if deepklox_sageattn is not None:
+            # DeepKlox validates canonical NHD strides before dispatch.
+            with device_op_timer("xpu.sage.prepare_qkv"):
+                query = self._canonical_nhd(query)
+                key = self._canonical_nhd(key)
+                value = self._canonical_nhd(value)
+            # DeepKlox fuses FP8 quantization into the kernel, so it cannot be timed apart.
+            with device_op_timer("xpu.sage.quant_attn_kernel_fused"):
+                return deepklox_sageattn(
+                    query,
+                    key,
+                    value,
+                    tensor_layout="NHD",
+                    is_causal=self.causal,
+                    sm_scale=self.softmax_scale,
+                    precision=_deepklox_sageattn_precision,
+                )
         if xpu_sageattn is None:
-            raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
+            raise ImportError("XPU SageAttention requires deepklox or auto-round-lib")
         orig_dtype = query.dtype
-        q = query.to(torch.float16) if orig_dtype != torch.float16 else query
-        k = key.to(torch.float16) if orig_dtype != torch.float16 else key
-        v = value.to(torch.float16) if orig_dtype != torch.float16 else value
+        with device_op_timer("xpu.sage.prepare_qkv"):
+            q = query.to(torch.float16) if orig_dtype != torch.float16 else query
+            k = key.to(torch.float16) if orig_dtype != torch.float16 else key
+            v = value.to(torch.float16) if orig_dtype != torch.float16 else value
 
-        if _sagev1_has_tensor_layout:
-            if _SAGE_ATTN_TENSOR_LAYOUT == "HND":
+            if _sagev1_has_tensor_layout:
+                if _SAGE_ATTN_TENSOR_LAYOUT == "HND":
+                    q = q.transpose(1, 2).contiguous()
+                    k = k.transpose(1, 2).contiguous()
+                    v = v.transpose(1, 2).contiguous()
+            else:
+                # No tensor_layout support: kernel expects HND [B, H, S, D]
                 q = q.transpose(1, 2).contiguous()
                 k = k.transpose(1, 2).contiguous()
                 v = v.transpose(1, 2).contiguous()
-            output = xpu_sageattn(
-                q,
-                k,
-                v,
-                tensor_layout=_SAGE_ATTN_TENSOR_LAYOUT,
-                is_causal=self.causal,
-                **{_sagev1_scale_param: self.softmax_scale},
-            )
+
+        if _sagev1_has_tensor_layout:
+            with device_op_timer("xpu.sage.quant_attn_kernel_fused"):
+                output = xpu_sageattn(
+                    q,
+                    k,
+                    v,
+                    tensor_layout=_SAGE_ATTN_TENSOR_LAYOUT,
+                    is_causal=self.causal,
+                    **{_sagev1_scale_param: self.softmax_scale},
+                )
             if _SAGE_ATTN_TENSOR_LAYOUT == "HND":
                 output = output.transpose(1, 2).contiguous()
         else:
-            # No tensor_layout support: kernel expects HND [B, H, S, D]
-            q = q.transpose(1, 2).contiguous()
-            k = k.transpose(1, 2).contiguous()
-            v = v.transpose(1, 2).contiguous()
-            output = xpu_sageattn(
-                q,
-                k,
-                v,
-                is_causal=self.causal,
-                **{_sagev1_scale_param: self.softmax_scale},
-            )
+            with device_op_timer("xpu.sage.quant_attn_kernel_fused"):
+                output = xpu_sageattn(
+                    q,
+                    k,
+                    v,
+                    is_causal=self.causal,
+                    **{_sagev1_scale_param: self.softmax_scale},
+                )
             output = output.transpose(1, 2).contiguous()
 
         if orig_dtype != torch.float16:

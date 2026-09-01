@@ -28,15 +28,17 @@ runs in the native dtype.
 | Device | FP8 FA |
 |--------|--------|
 | Ascend NPU | ✅ |
+| Intel XPU | ✅ |
 | NVIDIA GPU | ❌ |
 | AMD ROCm | ❌ |
-| Intel XPU | ❌ |
 
 Legend: `✅` supported, `❌` unsupported.
 
-FP8 FA is currently implemented only for the NPU Flash Attention backend. Other
-backends do not support `diffusion_kv_cache_dtype="fp8"` for diffusion attention
-and fall back to native dtype execution.
+FP8 FA is currently implemented for the NPU and XPU Flash Attention backends.
+The XPU path requires the DeepKlox FP8 flash-attention kernel (`deepklox`);
+it quantizes Q per token per head and K/V per tensor. Other backends do not
+support `diffusion_kv_cache_dtype="fp8"` for diffusion attention and fall back
+to native dtype execution.
 
 ## Model Type Support
 

@@ -67,6 +67,7 @@ class FlashAttentionImpl(AttentionImpl):
     # ``Attention(disable_kv_quant=True)``.
     _supported_kv_cache_dtypes = {
         "npu": {"fp8"},
+        "xpu": {"fp8"},
     }
 
     def __init__(
@@ -430,6 +431,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        extra = attn_metadata.extra if attn_metadata is not None else {}
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
@@ -439,10 +441,38 @@ class FlashAttentionImpl(AttentionImpl):
                 attention_mask,
             )
 
+        kv_cache_dtype = extra.get("kv_cache_dtype")
+        if kv_cache_dtype is not None:
+            # The FP8 kernel is driven with one uniform document per batch row,
+            # so packed multi-document metadata cannot be honored here.
+            if "cu_seqlens_q" in extra or attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+                logger.warning_once(
+                    "XPU FP8 attention does not support packed varlen/piecewise metadata; "
+                    "falling back to unquantized attention for this layer."
+                )
+            else:
+                return self.forward_fa_quant_xpu(query, key, value)
+
         return self._forward_varlen_dense(
             query,
             key,
             value,
+        )
+
+    def forward_fa_quant_xpu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        from vllm_omni.platforms.xpu.quant.fp8_attn_xpu import fp8_flash_attn_varlen_xpu
+
+        return fp8_flash_attn_varlen_xpu(
+            query,
+            key,
+            value,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
         )
 
     def forward_npu(
