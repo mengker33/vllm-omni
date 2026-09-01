@@ -41,7 +41,17 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     resolve_wan_sample_solver,
     retrieve_latents,
 )
-from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+    WanTransformer3DModel,
+    get_wan_device_op_timing_summary,
+    is_wan_device_op_timing_enabled,
+    reset_wan_device_op_timing,
+    wan_device_op_timer,
+)
+from vllm_omni.diffusion.profiler.device_op_timer import (
+    begin_device_op_timing_step,
+    dump_device_op_timing,
+)
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -391,6 +401,7 @@ class Wan22I2VPipeline(
                     current_guidance_scale = guidance_high
 
                 self.record_denoise_step(step_idx, t)
+                begin_device_op_timing_step(step_idx)
 
                 # Prepare latent input
                 if self.expand_timesteps:
@@ -466,6 +477,9 @@ class Wan22I2VPipeline(
         return create_transformer_from_config(config, quant_config=quant_config)
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        if is_wan_device_op_timing_enabled():
+            reset_wan_device_op_timing()
+
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
         prompt_texts = [prompt if isinstance(prompt, str) else (prompt.get("prompt") or "") for prompt in req.prompts]
@@ -743,7 +757,8 @@ class Wan22I2VPipeline(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+            with wan_device_op_timer("vae.decode"):
+                output = self.vae.decode(latents, return_dict=False)[0]
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -768,6 +783,14 @@ class Wan22I2VPipeline(
                     _t_pipeline_wall_ms,
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
+
+        if is_wan_device_op_timing_enabled() and _is_rank_zero():
+            device_timing_summary = get_wan_device_op_timing_summary()
+            if device_timing_summary:
+                logger.info("Wan2.2 I2V device op timing summary:\n%s", device_timing_summary)
+            timing_path = dump_device_op_timing()
+            if timing_path:
+                logger.info("Wan2.2 I2V device op timing written to %s", timing_path)
 
         return split_diffusion_output_by_request(
             DiffusionOutput(
