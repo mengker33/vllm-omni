@@ -67,7 +67,7 @@ class FlashAttentionImpl(AttentionImpl):
     # ``Attention(disable_kv_quant=True)``.
     _supported_kv_cache_dtypes = {
         "npu": {"fp8"},
-        "xpu": {"fp8"},
+        "xpu": {"fp8", "fp8_xpu_kernels"},
     }
 
     def __init__(
@@ -451,7 +451,7 @@ class FlashAttentionImpl(AttentionImpl):
                     "falling back to unquantized attention for this layer."
                 )
             else:
-                return self.forward_fa_quant_xpu(query, key, value)
+                return self.forward_fa_quant_xpu(query, key, value, kv_cache_dtype)
 
         return self._forward_varlen_dense(
             query,
@@ -464,6 +464,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        kv_cache_dtype: str,
     ) -> torch.Tensor:
         from vllm_omni.platforms.xpu.quant.fp8_attn_xpu import fp8_flash_attn_varlen_xpu
 
@@ -473,6 +474,7 @@ class FlashAttentionImpl(AttentionImpl):
             value,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
     def forward_npu(

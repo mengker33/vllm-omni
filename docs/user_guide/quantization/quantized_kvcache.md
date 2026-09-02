@@ -35,10 +35,20 @@ runs in the native dtype.
 Legend: `✅` supported, `❌` unsupported.
 
 FP8 FA is currently implemented for the NPU and XPU Flash Attention backends.
-The XPU path requires the DeepKlox FP8 flash-attention kernel (`deepklox`);
-it quantizes Q per token per head and K/V per tensor. Other backends do not
-support `diffusion_kv_cache_dtype="fp8"` for diffusion attention and fall back
-to native dtype execution.
+Other backends do not support FP8 diffusion attention and fall back to native
+dtype execution.
+
+The XPU backend offers two FP8 kernels, selected by the value of
+`diffusion_kv_cache_dtype`:
+
+| Value | Kernel | Quantization | Requirements |
+|-------|--------|--------------|--------------|
+| `fp8` | DeepKlox XE3 | Q per token per head, K/V per tensor | `deepklox` installed |
+| `fp8_xpu_kernels` | vllm-xpu-kernels non-paged full-FP8 prefill | Q/K/V per tensor | `vllm-xpu-kernels` installed, `head_dim == 128`, fp16/bf16 activations |
+
+`fp8` keeps per-token-per-head Q descales and is the more accurate of the two.
+`fp8_xpu_kernels` folds the Q/K descales into the softmax scale, so it needs
+per-tensor Q descales, but it runs Q/K/V through the fp8 DPAS GEMMs on Xe3.
 
 ## Model Type Support
 

@@ -44,6 +44,12 @@ from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
+from vllm_omni.diffusion.profiler.device_op_timer import (
+    device_op_timer as wan_device_op_timer,
+    get_device_op_timing_summary as get_wan_device_op_timing_summary,
+    is_device_op_timing_enabled as is_wan_device_op_timing_enabled,
+    reset_device_op_timing as reset_wan_device_op_timing,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -152,9 +158,11 @@ class WanFeedForward(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.net_0(hidden_states)
-        hidden_states = self.net_1(hidden_states)
-        hidden_states = self.net_2(hidden_states)
+        with wan_device_op_timer("ffn.up_proj"):
+            hidden_states = self.net_0(hidden_states)
+            hidden_states = self.net_1(hidden_states)
+        with wan_device_op_timer("ffn.down_proj"):
+            hidden_states = self.net_2(hidden_states)
         return hidden_states
 
 
@@ -426,35 +434,38 @@ class WanSelfAttention(nn.Module):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         # Fused QKV projection
-        qkv, _ = self.to_qkv(hidden_states)
+        with wan_device_op_timer("self_attn.qkv_proj"):
+            qkv, _ = self.to_qkv(hidden_states)
 
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
-        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        with wan_device_op_timer("self_attn.qk_norm_rope"):
+            query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        # Apply QK normalization
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+            # Apply QK normalization
+            query = self.norm_q(query)
+            key = self.norm_k(key)
 
-        # Reshape for multi-head attention
-        query = query.unflatten(2, (self.num_heads, self.head_dim))
-        key = key.unflatten(2, (self.num_kv_heads, self.head_dim))
-        value = value.unflatten(2, (self.num_kv_heads, self.head_dim))
+            # Reshape for multi-head attention
+            query = query.unflatten(2, (self.num_heads, self.head_dim))
+            key = key.unflatten(2, (self.num_kv_heads, self.head_dim))
+            value = value.unflatten(2, (self.num_kv_heads, self.head_dim))
 
-        # Apply rotary embeddings
-        if rotary_emb is not None:
-            freqs_cos, freqs_sin = rotary_emb
-            query = self.rotary_embedding(query, freqs_cos, freqs_sin)
-            key = self.rotary_embedding(key, freqs_cos, freqs_sin)
+            # Apply rotary embeddings
+            if rotary_emb is not None:
+                freqs_cos, freqs_sin = rotary_emb
+                query = self.rotary_embedding(query, freqs_cos, freqs_sin)
+                key = self.rotary_embedding(key, freqs_cos, freqs_sin)
 
-        # Compute attention using unified attention layer
+        # QKV quantization and the attention kernel are timed inside the attention backend.
         hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
         # Output projection
-        hidden_states = self.to_out(hidden_states)
-        hidden_states = self.dropout(hidden_states)
+        with wan_device_op_timer("self_attn.out_proj"):
+            hidden_states = self.to_out(hidden_states)
+            hidden_states = self.dropout(hidden_states)
 
         return hidden_states
 
@@ -601,19 +612,20 @@ class WanCrossAttention(nn.Module):
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
-        # Query projection
-        query = self.to_q(hidden_states)
-        query = self.norm_q(query)
+        with wan_device_op_timer("cross_attn.qkv_proj"):
+            # Query projection
+            query = self.to_q(hidden_states)
+            query = self.norm_q(query)
 
-        # KV projection from encoder
-        key = self.to_k(encoder_hidden_states)
-        value = self.to_v(encoder_hidden_states)
-        key = self.norm_k(key)
+            # KV projection from encoder
+            key = self.to_k(encoder_hidden_states)
+            value = self.to_v(encoder_hidden_states)
+            key = self.norm_k(key)
 
-        # Reshape for multi-head attention
-        query = query.unflatten(2, (self.num_heads, self.head_dim))
-        key = key.unflatten(2, (self.num_heads, self.head_dim))
-        value = value.unflatten(2, (self.num_heads, self.head_dim))
+            # Reshape for multi-head attention
+            query = query.unflatten(2, (self.num_heads, self.head_dim))
+            key = key.unflatten(2, (self.num_heads, self.head_dim))
+            value = value.unflatten(2, (self.num_heads, self.head_dim))
 
         # I2V: Additional attention with image embeddings
         hidden_states_img = None
@@ -630,17 +642,19 @@ class WanCrossAttention(nn.Module):
             hidden_states_img = hidden_states_img.type_as(query)
 
         # Main cross-attention using unified attention layer
-        hidden_states = self.attn(query, key, value, attn_metadata)
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+        with wan_device_op_timer("cross_attn.attn"):
+            hidden_states = self.attn(query, key, value, attn_metadata)
+            hidden_states = hidden_states.flatten(2, 3)
+            hidden_states = hidden_states.type_as(query)
 
         # Add image attention output if present
         if hidden_states_img is not None:
             hidden_states = hidden_states + hidden_states_img
 
         # Output projection
-        hidden_states = self.to_out(hidden_states)
-        hidden_states = self.dropout(hidden_states)
+        with wan_device_op_timer("cross_attn.out_proj"):
+            hidden_states = self.to_out(hidden_states)
+            hidden_states = self.dropout(hidden_states)
 
         return hidden_states
 
@@ -710,38 +724,45 @@ class WanTransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         hidden_states_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if temb.ndim == 4:
-            # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.unsqueeze(0) + temb
-            ).chunk(6, dim=2)
-            shift_msa = shift_msa.squeeze(2)
-            scale_msa = scale_msa.squeeze(2)
-            gate_msa = gate_msa.squeeze(2)
-            c_shift_msa = c_shift_msa.squeeze(2)
-            c_scale_msa = c_scale_msa.squeeze(2)
-            c_gate_msa = c_gate_msa.squeeze(2)
-        else:
-            # temb: batch_size, 6, inner_dim (wan2.1/wan2.2 14B)
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table + temb
-            ).chunk(6, dim=1)
+        with wan_device_op_timer("block.modulation"):
+            if temb.ndim == 4:
+                # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
+                shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                    self.scale_shift_table.unsqueeze(0) + temb
+                ).chunk(6, dim=2)
+                shift_msa = shift_msa.squeeze(2)
+                scale_msa = scale_msa.squeeze(2)
+                gate_msa = gate_msa.squeeze(2)
+                c_shift_msa = c_shift_msa.squeeze(2)
+                c_scale_msa = c_scale_msa.squeeze(2)
+                c_gate_msa = c_gate_msa.squeeze(2)
+            else:
+                # temb: batch_size, 6, inner_dim (wan2.1/wan2.2 14B)
+                shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                    self.scale_shift_table + temb
+                ).chunk(6, dim=1)
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
+        with wan_device_op_timer("block.norm_residual"):
+            norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
         self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
-        hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
+        with wan_device_op_timer("block.norm_residual"):
+            hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
-        norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
+        with wan_device_op_timer("block.norm_residual"):
+            norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None)
-        hidden_states = hidden_states + attn_output
+        with wan_device_op_timer("block.norm_residual"):
+            hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        norm_hidden_states = self.norm3(hidden_states, c_scale_msa, c_shift_msa).type_as(hidden_states)
+        with wan_device_op_timer("block.norm_residual"):
+            norm_hidden_states = self.norm3(hidden_states, c_scale_msa, c_shift_msa).type_as(hidden_states)
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states + ff_output * c_gate_msa).type_as(hidden_states)
+        with wan_device_op_timer("block.norm_residual"):
+            hidden_states = (hidden_states + ff_output * c_gate_msa).type_as(hidden_states)
 
         return hidden_states
 
@@ -1044,8 +1065,12 @@ class WanTransformer3DModel(nn.Module):
             )
 
         # Transformer blocks
+        # Timed at the call site so the scope survives torch.compile/cache-dit wrapping of the block.
         for block in self.blocks[self.start_layer : self.end_layer]:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+            with wan_device_op_timer("transformer.block"):
+                hidden_states = block(
+                    hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask
+                )
 
         if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
