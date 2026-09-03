@@ -67,7 +67,7 @@ class FlashAttentionImpl(AttentionImpl):
     # ``Attention(disable_kv_quant=True)``.
     _supported_kv_cache_dtypes = {
         "npu": {"fp8"},
-        "xpu": {"fp8", "fp8_xpu_kernels"},
+        "xpu": {"fp8", "fp8_xpu_kernels", "fp8_sycl_tla", "mxfp8_sycl_tla"},
     }
 
     def __init__(

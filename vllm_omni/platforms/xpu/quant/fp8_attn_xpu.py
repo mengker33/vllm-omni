@@ -11,15 +11,24 @@ flash-attention kernel. Two kernel providers are supported, selected by the
 * ``"fp8_xpu_kernels"`` -> vllm-xpu-kernels non-paged full-FP8 prefill, which
   folds per-tensor descales into the softmax scale and so requires scalar
   descales for Q as well.
+* ``"fp8_sycl_tla"`` -> the SYCL-TLA (CUTLASS-SYCL) ``sycl_tla_fmha`` prefill
+  binding, which has no descale inputs at all, so the scaling has to be folded
+  into the quantized values themselves.
+* ``"mxfp8_sycl_tla"`` -> the same binding's block-scaled entry point, which
+  takes UE8M0 scale factors covering 32 elements each, so per-tensor descales
+  are unnecessary and only the softmax scale has to be compensated.
 """
 
 from __future__ import annotations
 
 import math
+import os
+import sys
 from contextlib import nullcontext
 from functools import lru_cache
 
 import torch
+from vllm.logger import init_logger
 
 try:
     from vllm_omni.diffusion.profiler.device_op_timer import device_op_timer
@@ -27,6 +36,8 @@ except ModuleNotFoundError as exc:
     if exc.name != "vllm_omni.diffusion.profiler.device_op_timer":
         raise
     device_op_timer = nullcontext
+
+logger = init_logger(__name__)
 
 # The kernel accumulates in a reduced-range format, so descales target a
 # quantization range well below the fp8_e4m3 max (448) to keep headroom.
@@ -41,7 +52,23 @@ XPU_KERNELS_FP8_LABEL = "fp8_xpu_kernels"
 _XPU_KERNELS_HEAD_DIM = 128
 _XPU_KERNELS_OUT_DTYPES = (torch.float16, torch.bfloat16)
 
-_FP8_KV_LABELS = frozenset({"fp8", XPU_KERNELS_FP8_LABEL})
+# kv_cache_dtype label routing to the SYCL-TLA sycl_tla_fmha prefill binding.
+SYCL_TLA_FP8_LABEL = "fp8_sycl_tla"
+# Same binding, block-scaled (MX) variant with per-32-element UE8M0 scales.
+SYCL_TLA_MXFP8_LABEL = "mxfp8_sycl_tla"
+# Directory holding the built ``sycl_tla_fmha`` extension, if not on PYTHONPATH.
+SYCL_TLA_PATH_ENV = "VLLM_OMNI_SYCL_TLA_FMHA_PATH"
+_SYCL_TLA_HEAD_DIM = 128
+_FP8_E4M3_MAX = 448.0
+
+# MX block size and the e4m3 shared-exponent target (448 = 1.75 * 2^8).
+_MX_GROUP_SIZE = 32
+_MX_E4M3_EMAX = 8.0
+_UE8M0_BIAS = 127
+
+_FP8_KV_LABELS = frozenset(
+    {"fp8", XPU_KERNELS_FP8_LABEL, SYCL_TLA_FP8_LABEL, SYCL_TLA_MXFP8_LABEL}
+)
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
@@ -49,6 +76,9 @@ def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
     return kv_cache_dtype in _FP8_KV_LABELS
 
 
+# Dynamo ignores lru_cache and retraces the wrapped body; these loaders only
+# import an extension and hand back a pybind callable, so keep them opaque.
+@torch._dynamo.disable
 @lru_cache(maxsize=1)
 def _load_fp8_attn_func():
     try:
@@ -61,6 +91,7 @@ def _load_fp8_attn_func():
     return flash_attn_varlen_func
 
 
+@torch._dynamo.disable
 @lru_cache(maxsize=1)
 def _load_xpu_kernels_fp8_attn_func():
     try:
@@ -80,6 +111,52 @@ def _load_xpu_kernels_fp8_attn_func():
             f"flash-attention extension, which is unavailable: {FA2_UNAVAILABLE_REASON}"
         )
     return flash_attn_varlen_func
+
+
+@torch._dynamo.disable
+@lru_cache(maxsize=1)
+def _import_sycl_tla_fmha(label: str):
+    search_path = os.environ.get(SYCL_TLA_PATH_ENV)
+    if search_path and search_path not in sys.path:
+        sys.path.append(search_path)
+    try:
+        import sycl_tla_fmha
+    except ImportError as e:
+        raise ImportError(
+            f"kv_cache_dtype='{label}' requires the sycl_tla_fmha extension built from "
+            f"cutlass-sycl examples/06_bmg_flash_attention. Put its build directory on PYTHONPATH "
+            f"or set {SYCL_TLA_PATH_ENV} to it."
+        ) from e
+    return sycl_tla_fmha
+
+
+@torch._dynamo.disable
+@lru_cache(maxsize=1)
+def _load_sycl_tla_fmha_func():
+    module = _import_sycl_tla_fmha(SYCL_TLA_FP8_LABEL)
+    logger.info(
+        "SYCL-TLA FP8 E4M3 flash-attention enabled (kv_cache_dtype='%s') from %s",
+        SYCL_TLA_FP8_LABEL,
+        module.__file__,
+    )
+    return module.prefill_fp8_e4m3_bshd
+
+
+@torch._dynamo.disable
+@lru_cache(maxsize=1)
+def _load_sycl_tla_mxfp8_func():
+    module = _import_sycl_tla_fmha(SYCL_TLA_MXFP8_LABEL)
+    if not hasattr(module, "prefill_mxfp8_e4m3_bshd"):
+        raise ImportError(
+            f"kv_cache_dtype='{SYCL_TLA_MXFP8_LABEL}' requires a sycl_tla_fmha build that exports "
+            f"prefill_mxfp8_e4m3_bshd; rebuild the extension from {module.__file__}"
+        )
+    logger.info(
+        "SYCL-TLA MXFP8 E4M3 flash-attention enabled (kv_cache_dtype='%s') from %s",
+        SYCL_TLA_MXFP8_LABEL,
+        module.__file__,
+    )
+    return module.prefill_mxfp8_e4m3_bshd
 
 
 def _quantize_per_tensor(tensor: torch.Tensor, fp8_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
@@ -212,6 +289,215 @@ def _fp8_flash_attn_varlen_xpu_kernels(
     return output.reshape(batch, q_len, num_heads, head_dim)
 
 
+def _abs_amax(tensor: torch.Tensor) -> torch.Tensor:
+    # Two reductions rather than .float().abs().amax(), which materializes a
+    # full-size fp32 copy and then a full-size abs copy just to reduce them.
+    return torch.maximum(tensor.amax().abs(), tensor.amin().abs()).float()
+
+
+def _scale_to_fp8(tensor: torch.Tensor, scale: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
+    # e4m3fn has no infinities: PyTorch maps out-of-range inputs to NaN, so clamp first.
+    # copy=True is required: .to() is a no-op for an fp32 input, and mul_ would
+    # then write through into the caller's tensor.
+    return (
+        tensor.to(torch.float32, copy=True)
+        .mul_(scale)
+        .clamp_(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        .to(fp8_dtype)
+    )
+
+
+def _fp8_flash_attn_sycl_tla(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    """Run the SYCL-TLA ``sycl_tla_fmha`` FP8 E4M3 prefill kernel.
+
+    The binding takes no descales and hardcodes a ``1/sqrt(head_dim)`` softmax
+    scale, so the scaling is folded into the quantized tensors instead:
+
+    * Q and K get reciprocal scales whose product is
+      ``softmax_scale * sqrt(head_dim)``, which leaves the logits unchanged
+      while equalizing how much FP8 range each side uses.
+    * V is scaled to fill the FP8 range and the output is divided back out,
+      which is exact because ``P @ (c*V) == c * (P @ V)``.
+    """
+    prefill_fp8_e4m3_bshd = _load_sycl_tla_fmha_func()
+
+    head_dim = query.shape[-1]
+    out_dtype = query.dtype
+    if head_dim != _SYCL_TLA_HEAD_DIM:
+        raise ValueError(
+            f"kv_cache_dtype='{SYCL_TLA_FP8_LABEL}' only supports head_dim {_SYCL_TLA_HEAD_DIM}, got {head_dim}"
+        )
+    if fp8_dtype != torch.float8_e4m3fn:
+        raise ValueError(f"kv_cache_dtype='{SYCL_TLA_FP8_LABEL}' only supports float8_e4m3fn, got {fp8_dtype}")
+
+    with device_op_timer("xpu.fp8_mha.quantize_qkv"):
+        # alpha compensates for the kernel's fixed 1/sqrt(head_dim) softmax scale.
+        alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
+        q_amax = _abs_amax(query).clamp_(min=_MIN_DESCALE)
+        k_amax = _abs_amax(key).clamp_(min=_MIN_DESCALE)
+        v_amax = _abs_amax(value).clamp_(min=_MIN_DESCALE)
+
+        q_scale = torch.sqrt(alpha * k_amax / q_amax)
+        v_scale = FP8_QUANT_RANGE / v_amax
+
+        q_fp8 = _scale_to_fp8(query, q_scale, fp8_dtype)
+        k_fp8 = _scale_to_fp8(key, alpha / q_scale, fp8_dtype)
+        v_fp8 = _scale_to_fp8(value, v_scale, fp8_dtype)
+
+    with device_op_timer("xpu.fp8_mha.attn_kernel"):
+        # The binding runs on its own compat queue, so both of Torch's pending
+        # writes and the kernel's writes need an explicit fence.
+        torch.xpu.synchronize()
+        output = prefill_fp8_e4m3_bshd(q=q_fp8, k=k_fp8, v=v_fp8, is_causal=causal)
+        torch.xpu.synchronize()
+
+    # The binding hands back a private bf16 buffer, so rescale it in place.
+    return output.div_(v_scale).to(out_dtype)
+
+
+def _mx_exponent(blocked: torch.Tensor, reduce_dim: int) -> torch.Tensor:
+    # amax/amin instead of .abs().amax() avoids a full-size absolute-value copy.
+    amax = torch.maximum(blocked.amax(reduce_dim).abs(), blocked.amin(reduce_dim).abs()).float()
+    exponent = torch.floor(torch.log2(amax.clamp_min(torch.finfo(torch.float32).tiny)))
+    return (exponent - _MX_E4M3_EMAX).clamp(-_UE8M0_BIAS, _UE8M0_BIAS)
+
+
+def _mx_apply(blocked: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
+    # copy=True is required: .to() is a no-op for an fp32 input, and div_ would
+    # then write through into the caller's tensor.
+    return (
+        blocked.to(torch.float32, copy=True)
+        .div_(torch.exp2(exponent))
+        .clamp_(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+
+# Intel's Triton backend fails to lower the fused MX quantization kernel
+# (ConvertTritonIntelGPUToLLVM), so keep this out of any Inductor graph --
+# including an outer torch.compile around the attention layer.
+@torch._dynamo.disable
+def _mx_quantize(tensor: torch.Tensor, group_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """MX-quantize a ``[B, S, H, D]`` tensor along ``group_dim`` in blocks of 32.
+
+    Splits the group axis in place rather than moving it to the end, so every
+    reshape stays a view; ``movedim`` + ``reshape`` would force a full
+    transposing copy for the sequence-grouped case.
+
+    Returns (float8_e4m3fn values in the input's axis order, uint8 UE8M0
+    exponents shaped ``[B, S, H, D/32]`` for ``group_dim=3`` and
+    ``[B, ceil(S/32), H, D]`` for ``group_dim=1``).
+    """
+    g = _MX_GROUP_SIZE
+    b, s, h, d = tensor.shape
+
+    if group_dim == 3:
+        if d % g:
+            raise ValueError(f"head dim {d} must be a multiple of {g}")
+        blocked = tensor.reshape(b, s, h, d // g, g)
+        exponent = _mx_exponent(blocked, -1)
+        values = _mx_apply(blocked, exponent.unsqueeze(-1)).reshape(b, s, h, d)
+        return values, (exponent + _UE8M0_BIAS).to(torch.uint8)
+
+    if group_dim != 1:
+        raise ValueError(f"unsupported group_dim {group_dim}")
+
+    # A ragged tail is reduced separately so the full tensor never needs padding.
+    n_full = (s // g) * g
+    values = torch.empty((b, s, h, d), dtype=torch.float8_e4m3fn, device=tensor.device)
+
+    if n_full:
+        blocked = tensor[:, :n_full].reshape(b, n_full // g, g, h, d)
+        exponent = _mx_exponent(blocked, 2)
+        values[:, :n_full] = _mx_apply(blocked, exponent.unsqueeze(2)).reshape(b, n_full, h, d)
+    else:
+        exponent = None
+
+    if n_full < s:
+        tail = tensor[:, n_full:].unsqueeze(1)
+        tail_exponent = _mx_exponent(tail, 2)
+        values[:, n_full:] = _mx_apply(tail, tail_exponent.unsqueeze(2)).reshape(b, s - n_full, h, d)
+        exponent = tail_exponent if exponent is None else torch.cat([exponent, tail_exponent], dim=1)
+
+    return values, (exponent + _UE8M0_BIAS).to(torch.uint8)
+
+
+def _mxfp8_flash_attn_sycl_tla(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    """Run the SYCL-TLA ``sycl_tla_fmha`` MXFP8 E4M3 block-scaled prefill kernel.
+
+    Per-32-element UE8M0 scales are applied inside the kernel, so unlike the
+    per-tensor FP8 path there is no descale to fold into V or to divide back
+    out of the output. Only the kernel's fixed ``1/sqrt(head_dim)`` softmax
+    scale needs compensating, which is done by pre-scaling Q; MX then picks a
+    per-block exponent for the scaled values automatically.
+    """
+    prefill_mxfp8_e4m3_bshd = _load_sycl_tla_mxfp8_func()
+
+    head_dim = query.shape[-1]
+    out_dtype = query.dtype
+    if head_dim != _SYCL_TLA_HEAD_DIM:
+        raise ValueError(
+            f"kv_cache_dtype='{SYCL_TLA_MXFP8_LABEL}' only supports head_dim {_SYCL_TLA_HEAD_DIM}, "
+            f"got {head_dim}"
+        )
+    if fp8_dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"kv_cache_dtype='{SYCL_TLA_MXFP8_LABEL}' only supports float8_e4m3fn, got {fp8_dtype}"
+        )
+
+    with device_op_timer("xpu.fp8_mha.quantize_qkv"):
+        alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
+        scaled_query = query if alpha == 1.0 else query * alpha
+
+        # Q/K group along the head dim; V groups along the sequence, because the
+        # kernel indexes V as (head_size_vo, seq_len_kv).
+        q_fp8, q_exp = _mx_quantize(scaled_query, 3)
+        k_fp8, k_exp = _mx_quantize(key, 3)
+        v_fp8, v_exp = _mx_quantize(value, 1)
+
+        # Q/K exponents are [B, S, H, D/32], V's are [B, S/32, H, D]; both
+        # become the kernel's [B, H, groups, rows].
+        scale_q = q_exp.permute(0, 2, 3, 1).contiguous()
+        scale_k = k_exp.permute(0, 2, 3, 1).contiguous()
+        scale_v = v_exp.permute(0, 2, 1, 3).contiguous()
+
+    with device_op_timer("xpu.fp8_mha.attn_kernel"):
+        # The binding runs on its own compat queue, so both of Torch's pending
+        # writes and the kernel's writes need an explicit fence.
+        torch.xpu.synchronize()
+        output = prefill_mxfp8_e4m3_bshd(
+            q=q_fp8, k=k_fp8, v=v_fp8,
+            scale_q=scale_q, scale_k=scale_k, scale_v=scale_v,
+            is_causal=causal,
+        )
+        torch.xpu.synchronize()
+
+    return output.to(out_dtype)
+
+
+_FP8_IMPLS = {
+    XPU_KERNELS_FP8_LABEL: _fp8_flash_attn_varlen_xpu_kernels,
+    SYCL_TLA_FP8_LABEL: _fp8_flash_attn_sycl_tla,
+    SYCL_TLA_MXFP8_LABEL: _mxfp8_flash_attn_sycl_tla,
+}
+
+
 def fp8_flash_attn_varlen_xpu(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -233,11 +519,7 @@ def fp8_flash_attn_varlen_xpu(
     if key.shape[0] != query.shape[0] or value.shape[0] != query.shape[0]:
         raise ValueError("fp8_flash_attn_varlen_xpu requires matching batch sizes for Q/K/V")
 
-    impl = (
-        _fp8_flash_attn_varlen_xpu_kernels
-        if kv_cache_dtype == XPU_KERNELS_FP8_LABEL
-        else _fp8_flash_attn_varlen_deepklox
-    )
+    impl = _FP8_IMPLS.get(kv_cache_dtype, _fp8_flash_attn_varlen_deepklox)
     return impl(
         query,
         key,
