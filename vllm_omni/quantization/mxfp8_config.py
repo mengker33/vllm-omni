@@ -50,6 +50,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.fp8 import CopyNumelCounter
+# from vllm.model_executor.model_loader.reload.meta import (
+#     CopyCounter as CopyNumelCounter,
+# )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import ModelWeightParameter
@@ -502,6 +505,12 @@ class VllmMxfp8OnlineLinearMethod(_VllmMxfp8OnlineBase):
         from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 
         self.kernel = init_mxfp8_linear_kernel()
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Use a physically contiguous [K, N] B operand for the XPU GEMM."""
+        super().process_weights_after_loading(layer)
+        if current_omni_platform.is_xpu() and not layer.weight.is_contiguous():
+            layer.weight.data = layer.weight.data.contiguous()
 
     def apply(
         self,
