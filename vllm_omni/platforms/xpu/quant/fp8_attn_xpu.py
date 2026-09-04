@@ -327,6 +327,8 @@ def _fp8_flash_attn_sycl_tla(
         raise ValueError(f"kv_cache_dtype='{SYCL_TLA_FP8_LABEL}' only supports float8_e4m3fn, got {fp8_dtype}")
 
     # alpha compensates for the kernel's fixed 1/sqrt(head_dim) softmax scale.
+    quant_start_event = torch.Event(enable_timing=True)
+    quant_start_event.record()
     alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
     q_amax = _abs_amax(query).clamp_(min=_MIN_DESCALE)
     k_amax = _abs_amax(key).clamp_(min=_MIN_DESCALE)
@@ -338,12 +340,21 @@ def _fp8_flash_attn_sycl_tla(
     q_fp8 = _scale_to_fp8(query, q_scale, fp8_dtype)
     k_fp8 = _scale_to_fp8(key, alpha / q_scale, fp8_dtype)
     v_fp8 = _scale_to_fp8(value, v_scale, fp8_dtype)
+    quant_end_event = torch.Event(enable_timing=True)
+    quant_end_event.record()
+    torch.xpu.synchronize()
+    print(f"SYCL-TLA FP8 attention quantization device time: {quant_start_event.elapsed_time(quant_end_event):.3f} ms")
 
     # The binding runs on its own compat queue, so both of Torch's pending
     # writes and the kernel's writes need an explicit fence.
     torch.xpu.synchronize()
+    start_event = torch.Event(enable_timing=True)
+    start_event.record()
     output = prefill_fp8_e4m3_bshd(q=q_fp8, k=k_fp8, v=v_fp8, is_causal=causal)
+    end_event = torch.Event(enable_timing=True)
+    end_event.record()
     torch.xpu.synchronize()
+    print(f"SYCL-TLA FP8 attention device time: {start_event.elapsed_time(end_event):.3f} ms")
 
     # The binding hands back a private bf16 buffer, so rescale it in place.
     return output.div_(v_scale).to(out_dtype)
@@ -447,6 +458,8 @@ def _mxfp8_flash_attn_sycl_tla(
             f"kv_cache_dtype='{SYCL_TLA_MXFP8_LABEL}' only supports float8_e4m3fn, got {fp8_dtype}"
         )
 
+    quant_start_event = torch.Event(enable_timing=True)
+    quant_start_event.record()
     alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
     scaled_query = query if alpha == 1.0 else query * alpha
 
@@ -455,6 +468,13 @@ def _mxfp8_flash_attn_sycl_tla(
     q_fp8, q_exp = _mx_quantize(scaled_query, 3)
     k_fp8, k_exp = _mx_quantize(key, 3)
     v_fp8, v_exp = _mx_quantize(value, 1)
+    quant_end_event = torch.Event(enable_timing=True)
+    quant_end_event.record()
+    torch.xpu.synchronize()
+    print(
+        f"SYCL-TLA MXFP8 attention quantization device time: "
+        f"{quant_start_event.elapsed_time(quant_end_event):.3f} ms"
+    )
 
     # Q/K exponents are [B, S, H, D/32], V's are [B, S/32, H, D]; both
     # become the kernel's [B, H, groups, rows].
@@ -465,12 +485,17 @@ def _mxfp8_flash_attn_sycl_tla(
     # The binding runs on its own compat queue, so both of Torch's pending
     # writes and the kernel's writes need an explicit fence.
     torch.xpu.synchronize()
+    start_event = torch.Event(enable_timing=True)
+    start_event.record()
     output = prefill_mxfp8_e4m3_bshd(
         q=q_fp8, k=k_fp8, v=v_fp8,
         scale_q=scale_q, scale_k=scale_k, scale_v=scale_v,
         is_causal=causal,
     )
+    end_event = torch.Event(enable_timing=True)
+    end_event.record()
     torch.xpu.synchronize()
+    print(f"SYCL-TLA MXFP8 attention device time: {start_event.elapsed_time(end_event):.3f} ms")
 
     return output.to(out_dtype)
 
