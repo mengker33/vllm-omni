@@ -24,12 +24,35 @@ from __future__ import annotations
 import math
 import os
 import sys
+from contextlib import contextmanager
 from functools import lru_cache
 
 import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Set to 1/true/yes/on to log per-call attention and quantization device times.
+ATTN_TIMING_ENV = "VLLM_OMNI_XPU_ATTN_TIMING"
+
+
+def _attn_timing_enabled() -> bool:
+    return os.environ.get(ATTN_TIMING_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+@contextmanager
+def _attn_timer(label: str):
+    """Time a device region and log it, or do nothing when timing is disabled."""
+    if not _attn_timing_enabled():
+        yield
+        return
+    start_event = torch.Event(enable_timing=True)
+    start_event.record()
+    yield
+    end_event = torch.Event(enable_timing=True)
+    end_event.record()
+    torch.xpu.synchronize()
+    logger.info("%s device time: %.3f ms", label, start_event.elapsed_time(end_event))
 
 # The kernel accumulates in a reduced-range format, so descales target a
 # quantization range well below the fp8_e4m3 max (448) to keep headroom.
@@ -327,52 +350,63 @@ def _fp8_flash_attn_sycl_tla(
         raise ValueError(f"kv_cache_dtype='{SYCL_TLA_FP8_LABEL}' only supports float8_e4m3fn, got {fp8_dtype}")
 
     # alpha compensates for the kernel's fixed 1/sqrt(head_dim) softmax scale.
-    quant_start_event = torch.Event(enable_timing=True)
-    quant_start_event.record()
-    alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
-    q_amax = _abs_amax(query).clamp_(min=_MIN_DESCALE)
-    k_amax = _abs_amax(key).clamp_(min=_MIN_DESCALE)
-    v_amax = _abs_amax(value).clamp_(min=_MIN_DESCALE)
+    with _attn_timer("SYCL-TLA FP8 attention quantization"):
+        alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
+        q_amax = _abs_amax(query).clamp_(min=_MIN_DESCALE)
+        k_amax = _abs_amax(key).clamp_(min=_MIN_DESCALE)
+        v_amax = _abs_amax(value).clamp_(min=_MIN_DESCALE)
 
-    q_scale = torch.sqrt(alpha * k_amax / q_amax)
-    v_scale = FP8_QUANT_RANGE / v_amax
+        q_scale = torch.sqrt(alpha * k_amax / q_amax)
+        v_scale = FP8_QUANT_RANGE / v_amax
 
-    q_fp8 = _scale_to_fp8(query, q_scale, fp8_dtype)
-    k_fp8 = _scale_to_fp8(key, alpha / q_scale, fp8_dtype)
-    v_fp8 = _scale_to_fp8(value, v_scale, fp8_dtype)
-    quant_end_event = torch.Event(enable_timing=True)
-    quant_end_event.record()
-    torch.xpu.synchronize()
-    print(f"SYCL-TLA FP8 attention quantization device time: {quant_start_event.elapsed_time(quant_end_event):.3f} ms")
+        q_fp8 = _scale_to_fp8(query, q_scale, fp8_dtype)
+        k_fp8 = _scale_to_fp8(key, alpha / q_scale, fp8_dtype)
+        v_fp8 = _scale_to_fp8(value, v_scale, fp8_dtype)
 
     # The binding runs on its own compat queue, so both of Torch's pending
     # writes and the kernel's writes need an explicit fence.
     torch.xpu.synchronize()
-    start_event = torch.Event(enable_timing=True)
-    start_event.record()
-    output = prefill_fp8_e4m3_bshd(q=q_fp8, k=k_fp8, v=v_fp8, is_causal=causal)
-    end_event = torch.Event(enable_timing=True)
-    end_event.record()
-    torch.xpu.synchronize()
-    print(f"SYCL-TLA FP8 attention device time: {start_event.elapsed_time(end_event):.3f} ms")
+    with _attn_timer("SYCL-TLA FP8 attention"):
+        output = prefill_fp8_e4m3_bshd(q=q_fp8, k=k_fp8, v=v_fp8, is_causal=causal)
 
     # The binding hands back a private bf16 buffer, so rescale it in place.
     return output.div_(v_scale).to(out_dtype)
 
 
-def _mx_exponent(blocked: torch.Tensor, reduce_dim: int) -> torch.Tensor:
-    # amax/amin instead of .abs().amax() avoids a full-size absolute-value copy.
-    amax = torch.maximum(blocked.amax(reduce_dim).abs(), blocked.amin(reduce_dim).abs()).float()
+def _mx_group_amax_head_dim(tensor: torch.Tensor) -> torch.Tensor:
+    """max|x| per contiguous 32-element group along the head dim of ``[B, S, H, D]``.
+
+    Pooling instead of ``amax`` over a 32-wide innermost axis: the reduction
+    kernel only reaches ~56 GB/s on that layout, which measures ~5x slower.
+    """
+    b, s, h, d = tensor.shape
+    pooled = torch.nn.functional.max_pool1d(
+        tensor.abs().reshape(1, b * s * h, d), _MX_GROUP_SIZE, _MX_GROUP_SIZE
+    )
+    return pooled.reshape(b, s, h, d // _MX_GROUP_SIZE).float()
+
+
+def _mx_exponent_from_amax(amax: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    if scale != 1.0:
+        amax = amax.mul_(scale)
     exponent = torch.floor(torch.log2(amax.clamp_min(torch.finfo(torch.float32).tiny)))
     return (exponent - _MX_E4M3_EMAX).clamp(-_UE8M0_BIAS, _UE8M0_BIAS)
 
 
-def _mx_apply(blocked: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
-    # copy=True is required: .to() is a no-op for an fp32 input, and div_ would
-    # then write through into the caller's tensor.
+def _mx_exponent(blocked: torch.Tensor, reduce_dim: int, scale: float = 1.0) -> torch.Tensor:
+    # One abs() pass plus one reduction, rather than reducing twice for amax/amin.
+    return _mx_exponent_from_amax(blocked.abs().amax(reduce_dim).float(), scale)
+
+
+def _mx_apply(blocked: torch.Tensor, exponent: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    # exp2(-exponent) folds the descale and ``scale`` into one broadcast multiply.
+    factor = torch.exp2(exponent.neg())
+    if scale != 1.0:
+        factor = factor.mul_(scale)
+    # The block descale is a power of two, so applying it in the input dtype is
+    # exact and avoids a full-size fp32 temporary.
     return (
-        blocked.to(torch.float32, copy=True)
-        .div_(torch.exp2(exponent))
+        torch.mul(blocked, factor.to(blocked.dtype))
         .clamp_(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
         .to(torch.float8_e4m3fn)
     )
@@ -382,12 +416,15 @@ def _mx_apply(blocked: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
 # (ConvertTritonIntelGPUToLLVM), so keep this out of any Inductor graph --
 # including an outer torch.compile around the attention layer.
 @torch._dynamo.disable
-def _mx_quantize(tensor: torch.Tensor, group_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _mx_quantize(tensor: torch.Tensor, group_dim: int, scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
     """MX-quantize a ``[B, S, H, D]`` tensor along ``group_dim`` in blocks of 32.
 
     Splits the group axis in place rather than moving it to the end, so every
     reshape stays a view; ``movedim`` + ``reshape`` would force a full
     transposing copy for the sequence-grouped case.
+
+    ``scale`` is applied to the values as part of the quantization multiply,
+    which avoids materializing a separately scaled copy of the input.
 
     Returns (float8_e4m3fn values in the input's axis order, uint8 UE8M0
     exponents shaped ``[B, S, H, D/32]`` for ``group_dim=3`` and
@@ -400,29 +437,37 @@ def _mx_quantize(tensor: torch.Tensor, group_dim: int) -> tuple[torch.Tensor, to
         if d % g:
             raise ValueError(f"head dim {d} must be a multiple of {g}")
         blocked = tensor.reshape(b, s, h, d // g, g)
-        exponent = _mx_exponent(blocked, -1)
-        values = _mx_apply(blocked, exponent.unsqueeze(-1)).reshape(b, s, h, d)
+        exponent = _mx_exponent_from_amax(_mx_group_amax_head_dim(tensor), scale)
+        values = _mx_apply(blocked, exponent.unsqueeze(-1), scale).reshape(b, s, h, d)
         return values, (exponent + _UE8M0_BIAS).to(torch.uint8)
 
     if group_dim != 1:
         raise ValueError(f"unsupported group_dim {group_dim}")
 
-    # A ragged tail is reduced separately so the full tensor never needs padding.
     n_full = (s // g) * g
+
+    # Whole groups only: collapse to [groups, 32, H*D] so the broadcast multiply
+    # keeps a contiguous innermost axis, and skip the staging buffer entirely.
+    if n_full == s:
+        blocked = tensor.reshape(b * (s // g), g, h * d)
+        exponent = _mx_exponent(blocked, 1, scale)
+        values = _mx_apply(blocked, exponent.unsqueeze(1), scale).reshape(b, s, h, d)
+        return values, (exponent.reshape(b, s // g, h, d) + _UE8M0_BIAS).to(torch.uint8)
+
+    # A ragged tail is reduced separately so the full tensor never needs padding.
     values = torch.empty((b, s, h, d), dtype=torch.float8_e4m3fn, device=tensor.device)
 
     if n_full:
         blocked = tensor[:, :n_full].reshape(b, n_full // g, g, h, d)
-        exponent = _mx_exponent(blocked, 2)
-        values[:, :n_full] = _mx_apply(blocked, exponent.unsqueeze(2)).reshape(b, n_full, h, d)
+        exponent = _mx_exponent(blocked, 2, scale)
+        values[:, :n_full] = _mx_apply(blocked, exponent.unsqueeze(2), scale).reshape(b, n_full, h, d)
     else:
         exponent = None
 
-    if n_full < s:
-        tail = tensor[:, n_full:].unsqueeze(1)
-        tail_exponent = _mx_exponent(tail, 2)
-        values[:, n_full:] = _mx_apply(tail, tail_exponent.unsqueeze(2)).reshape(b, s - n_full, h, d)
-        exponent = tail_exponent if exponent is None else torch.cat([exponent, tail_exponent], dim=1)
+    tail = tensor[:, n_full:].unsqueeze(1)
+    tail_exponent = _mx_exponent(tail, 2, scale)
+    values[:, n_full:] = _mx_apply(tail, tail_exponent.unsqueeze(2), scale).reshape(b, s - n_full, h, d)
+    exponent = tail_exponent if exponent is None else torch.cat([exponent, tail_exponent], dim=1)
 
     return values, (exponent + _UE8M0_BIAS).to(torch.uint8)
 
@@ -441,8 +486,8 @@ def _mxfp8_flash_attn_sycl_tla(
     Per-32-element UE8M0 scales are applied inside the kernel, so unlike the
     per-tensor FP8 path there is no descale to fold into V or to divide back
     out of the output. Only the kernel's fixed ``1/sqrt(head_dim)`` softmax
-    scale needs compensating, which is done by pre-scaling Q; MX then picks a
-    per-block exponent for the scaled values automatically.
+    scale needs compensating, which is folded into Q's quantization multiply;
+    MX then picks a per-block exponent for the scaled values automatically.
     """
     prefill_mxfp8_e4m3_bshd = _load_sycl_tla_mxfp8_func()
 
@@ -458,23 +503,14 @@ def _mxfp8_flash_attn_sycl_tla(
             f"kv_cache_dtype='{SYCL_TLA_MXFP8_LABEL}' only supports float8_e4m3fn, got {fp8_dtype}"
         )
 
-    quant_start_event = torch.Event(enable_timing=True)
-    quant_start_event.record()
-    alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
-    scaled_query = query if alpha == 1.0 else query * alpha
+    with _attn_timer("SYCL-TLA MXFP8 attention quantization"):
+        alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
 
-    # Q/K group along the head dim; V groups along the sequence, because the
-    # kernel indexes V as (head_size_vo, seq_len_kv).
-    q_fp8, q_exp = _mx_quantize(scaled_query, 3)
-    k_fp8, k_exp = _mx_quantize(key, 3)
-    v_fp8, v_exp = _mx_quantize(value, 1)
-    quant_end_event = torch.Event(enable_timing=True)
-    quant_end_event.record()
-    torch.xpu.synchronize()
-    print(
-        f"SYCL-TLA MXFP8 attention quantization device time: "
-        f"{quant_start_event.elapsed_time(quant_end_event):.3f} ms"
-    )
+        # Q/K group along the head dim; V groups along the sequence, because the
+        # kernel indexes V as (head_size_vo, seq_len_kv).
+        q_fp8, q_exp = _mx_quantize(query, 3, alpha)
+        k_fp8, k_exp = _mx_quantize(key, 3)
+        v_fp8, v_exp = _mx_quantize(value, 1)
 
     # Q/K exponents are [B, S, H, D/32], V's are [B, S/32, H, D]; both
     # become the kernel's [B, H, groups, rows].
@@ -485,17 +521,12 @@ def _mxfp8_flash_attn_sycl_tla(
     # The binding runs on its own compat queue, so both of Torch's pending
     # writes and the kernel's writes need an explicit fence.
     torch.xpu.synchronize()
-    start_event = torch.Event(enable_timing=True)
-    start_event.record()
-    output = prefill_mxfp8_e4m3_bshd(
-        q=q_fp8, k=k_fp8, v=v_fp8,
-        scale_q=scale_q, scale_k=scale_k, scale_v=scale_v,
-        is_causal=causal,
-    )
-    end_event = torch.Event(enable_timing=True)
-    end_event.record()
-    torch.xpu.synchronize()
-    print(f"SYCL-TLA MXFP8 attention device time: {start_event.elapsed_time(end_event):.3f} ms")
+    with _attn_timer("SYCL-TLA MXFP8 attention"):
+        output = prefill_mxfp8_e4m3_bshd(
+            q=q_fp8, k=k_fp8, v=v_fp8,
+            scale_q=scale_q, scale_k=scale_k, scale_v=scale_v,
+            is_causal=causal,
+        )
 
     return output.to(out_dtype)
 
