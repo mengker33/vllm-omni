@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from contextlib import nullcontext
 
 import torch
 from vllm.logger import init_logger
@@ -12,12 +11,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-try:
-    from vllm_omni.diffusion.profiler.device_op_timer import device_op_timer
-except ModuleNotFoundError as exc:
-    if exc.name != "vllm_omni.diffusion.profiler.device_op_timer":
-        raise
-    device_op_timer = nullcontext
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -133,61 +126,55 @@ class SageAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         if deepklox_sageattn is not None:
             # DeepKlox validates canonical NHD strides before dispatch.
-            with device_op_timer("xpu.sage.prepare_qkv"):
-                query = self._canonical_nhd(query)
-                key = self._canonical_nhd(key)
-                value = self._canonical_nhd(value)
-            # DeepKlox fuses FP8 quantization into the kernel, so it cannot be timed apart.
-            with device_op_timer("xpu.sage.quant_attn_kernel_fused"):
-                return deepklox_sageattn(
-                    query,
-                    key,
-                    value,
-                    tensor_layout="NHD",
-                    is_causal=self.causal,
-                    sm_scale=self.softmax_scale,
-                    precision=_deepklox_sageattn_precision,
-                )
+            query = self._canonical_nhd(query)
+            key = self._canonical_nhd(key)
+            value = self._canonical_nhd(value)
+            return deepklox_sageattn(
+                query,
+                key,
+                value,
+                tensor_layout="NHD",
+                is_causal=self.causal,
+                sm_scale=self.softmax_scale,
+                precision=_deepklox_sageattn_precision,
+            )
         if xpu_sageattn is None:
             raise ImportError("XPU SageAttention requires deepklox or auto-round-lib")
         orig_dtype = query.dtype
-        with device_op_timer("xpu.sage.prepare_qkv"):
-            q = query.to(torch.float16) if orig_dtype != torch.float16 else query
-            k = key.to(torch.float16) if orig_dtype != torch.float16 else key
-            v = value.to(torch.float16) if orig_dtype != torch.float16 else value
+        q = query.to(torch.float16) if orig_dtype != torch.float16 else query
+        k = key.to(torch.float16) if orig_dtype != torch.float16 else key
+        v = value.to(torch.float16) if orig_dtype != torch.float16 else value
 
-            if _sagev1_has_tensor_layout:
-                if _SAGE_ATTN_TENSOR_LAYOUT == "HND":
-                    q = q.transpose(1, 2).contiguous()
-                    k = k.transpose(1, 2).contiguous()
-                    v = v.transpose(1, 2).contiguous()
-            else:
-                # No tensor_layout support: kernel expects HND [B, H, S, D]
+        if _sagev1_has_tensor_layout:
+            if _SAGE_ATTN_TENSOR_LAYOUT == "HND":
                 q = q.transpose(1, 2).contiguous()
                 k = k.transpose(1, 2).contiguous()
                 v = v.transpose(1, 2).contiguous()
+        else:
+            # No tensor_layout support: kernel expects HND [B, H, S, D]
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
 
         if _sagev1_has_tensor_layout:
-            with device_op_timer("xpu.sage.quant_attn_kernel_fused"):
-                output = xpu_sageattn(
-                    q,
-                    k,
-                    v,
-                    tensor_layout=_SAGE_ATTN_TENSOR_LAYOUT,
-                    is_causal=self.causal,
-                    **{_sagev1_scale_param: self.softmax_scale},
-                )
+            output = xpu_sageattn(
+                q,
+                k,
+                v,
+                tensor_layout=_SAGE_ATTN_TENSOR_LAYOUT,
+                is_causal=self.causal,
+                **{_sagev1_scale_param: self.softmax_scale},
+            )
             if _SAGE_ATTN_TENSOR_LAYOUT == "HND":
                 output = output.transpose(1, 2).contiguous()
         else:
-            with device_op_timer("xpu.sage.quant_attn_kernel_fused"):
-                output = xpu_sageattn(
-                    q,
-                    k,
-                    v,
-                    is_causal=self.causal,
-                    **{_sagev1_scale_param: self.softmax_scale},
-                )
+            output = xpu_sageattn(
+                q,
+                k,
+                v,
+                is_causal=self.causal,
+                **{_sagev1_scale_param: self.softmax_scale},
+            )
             output = output.transpose(1, 2).contiguous()
 
         if orig_dtype != torch.float16:

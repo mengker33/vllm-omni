@@ -24,18 +24,10 @@ from __future__ import annotations
 import math
 import os
 import sys
-from contextlib import nullcontext
 from functools import lru_cache
 
 import torch
 from vllm.logger import init_logger
-
-try:
-    from vllm_omni.diffusion.profiler.device_op_timer import device_op_timer
-except ModuleNotFoundError as exc:
-    if exc.name != "vllm_omni.diffusion.profiler.device_op_timer":
-        raise
-    device_op_timer = nullcontext
 
 logger = init_logger(__name__)
 
@@ -200,31 +192,29 @@ def _fp8_flash_attn_varlen_deepklox(
     k_len = key.shape[1]
     out_dtype = query.dtype
 
-    with device_op_timer("xpu.fp8_mha.quantize_qkv"):
-        q_fp8, q_descale = _quantize_per_token_per_head(query, fp8_dtype)
-        k_fp8, k_descale = _quantize_per_tensor(key, fp8_dtype)
-        v_fp8, v_descale = _quantize_per_tensor(value, fp8_dtype)
+    q_fp8, q_descale = _quantize_per_token_per_head(query, fp8_dtype)
+    k_fp8, k_descale = _quantize_per_tensor(key, fp8_dtype)
+    v_fp8, v_descale = _quantize_per_tensor(value, fp8_dtype)
 
     cu_seqlens_q = torch.arange(0, (batch + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
     cu_seqlens_k = torch.arange(0, (batch + 1) * k_len, step=k_len, dtype=torch.int32, device=query.device)
     output = torch.empty(batch * q_len, num_heads, head_dim, dtype=out_dtype, device=query.device)
 
-    with device_op_timer("xpu.fp8_mha.attn_kernel"):
-        flash_attn_varlen_func(
-            q_fp8.flatten(0, 1),
-            k_fp8.flatten(0, 1),
-            v_fp8.flatten(0, 1),
-            cu_seqlens_q,
-            cu_seqlens_k,
-            q_len,
-            k_len,
-            softmax_scale=softmax_scale if softmax_scale is not None else head_dim**-0.5,
-            causal=causal,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            out=output,
-        )
+    flash_attn_varlen_func(
+        q_fp8.flatten(0, 1),
+        k_fp8.flatten(0, 1),
+        v_fp8.flatten(0, 1),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        q_len,
+        k_len,
+        softmax_scale=softmax_scale if softmax_scale is not None else head_dim**-0.5,
+        causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        out=output,
+    )
     return output.reshape(batch, q_len, num_heads, head_dim)
 
 
@@ -260,32 +250,30 @@ def _fp8_flash_attn_varlen_xpu_kernels(
             f"kv_cache_dtype='{XPU_KERNELS_FP8_LABEL}' requires float16 or bfloat16 query dtype, got {out_dtype}"
         )
 
-    with device_op_timer("xpu.fp8_mha.quantize_qkv"):
-        q_fp8, q_descale = _quantize_per_tensor(query, fp8_dtype)
-        k_fp8, k_descale = _quantize_per_tensor(key, fp8_dtype)
-        v_fp8, v_descale = _quantize_per_tensor(value, fp8_dtype)
+    q_fp8, q_descale = _quantize_per_tensor(query, fp8_dtype)
+    k_fp8, k_descale = _quantize_per_tensor(key, fp8_dtype)
+    v_fp8, v_descale = _quantize_per_tensor(value, fp8_dtype)
 
     cu_seqlens_q = torch.arange(0, (batch + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
     cu_seqlens_k = torch.arange(0, (batch + 1) * k_len, step=k_len, dtype=torch.int32, device=query.device)
     output = torch.empty(batch * q_len, num_heads, head_dim, dtype=out_dtype, device=query.device)
     kv_scale_shape = (batch, num_kv_heads)
 
-    with device_op_timer("xpu.fp8_mha.attn_kernel"):
-        flash_attn_varlen_func(
-            q_fp8.flatten(0, 1),
-            k_fp8.flatten(0, 1),
-            v_fp8.flatten(0, 1),
-            q_len,
-            cu_seqlens_q,
-            k_len,
-            cu_seqlens_k=cu_seqlens_k,
-            softmax_scale=softmax_scale if softmax_scale is not None else head_dim**-0.5,
-            causal=causal,
-            q_descale=q_descale,
-            k_descale=k_descale.expand(kv_scale_shape),
-            v_descale=v_descale.expand(kv_scale_shape),
-            out=output,
-        )
+    flash_attn_varlen_func(
+        q_fp8.flatten(0, 1),
+        k_fp8.flatten(0, 1),
+        v_fp8.flatten(0, 1),
+        q_len,
+        cu_seqlens_q,
+        k_len,
+        cu_seqlens_k=cu_seqlens_k,
+        softmax_scale=softmax_scale if softmax_scale is not None else head_dim**-0.5,
+        causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale.expand(kv_scale_shape),
+        v_descale=v_descale.expand(kv_scale_shape),
+        out=output,
+    )
     return output.reshape(batch, q_len, num_heads, head_dim)
 
 
@@ -338,26 +326,24 @@ def _fp8_flash_attn_sycl_tla(
     if fp8_dtype != torch.float8_e4m3fn:
         raise ValueError(f"kv_cache_dtype='{SYCL_TLA_FP8_LABEL}' only supports float8_e4m3fn, got {fp8_dtype}")
 
-    with device_op_timer("xpu.fp8_mha.quantize_qkv"):
-        # alpha compensates for the kernel's fixed 1/sqrt(head_dim) softmax scale.
-        alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
-        q_amax = _abs_amax(query).clamp_(min=_MIN_DESCALE)
-        k_amax = _abs_amax(key).clamp_(min=_MIN_DESCALE)
-        v_amax = _abs_amax(value).clamp_(min=_MIN_DESCALE)
+    # alpha compensates for the kernel's fixed 1/sqrt(head_dim) softmax scale.
+    alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
+    q_amax = _abs_amax(query).clamp_(min=_MIN_DESCALE)
+    k_amax = _abs_amax(key).clamp_(min=_MIN_DESCALE)
+    v_amax = _abs_amax(value).clamp_(min=_MIN_DESCALE)
 
-        q_scale = torch.sqrt(alpha * k_amax / q_amax)
-        v_scale = FP8_QUANT_RANGE / v_amax
+    q_scale = torch.sqrt(alpha * k_amax / q_amax)
+    v_scale = FP8_QUANT_RANGE / v_amax
 
-        q_fp8 = _scale_to_fp8(query, q_scale, fp8_dtype)
-        k_fp8 = _scale_to_fp8(key, alpha / q_scale, fp8_dtype)
-        v_fp8 = _scale_to_fp8(value, v_scale, fp8_dtype)
+    q_fp8 = _scale_to_fp8(query, q_scale, fp8_dtype)
+    k_fp8 = _scale_to_fp8(key, alpha / q_scale, fp8_dtype)
+    v_fp8 = _scale_to_fp8(value, v_scale, fp8_dtype)
 
-    with device_op_timer("xpu.fp8_mha.attn_kernel"):
-        # The binding runs on its own compat queue, so both of Torch's pending
-        # writes and the kernel's writes need an explicit fence.
-        torch.xpu.synchronize()
-        output = prefill_fp8_e4m3_bshd(q=q_fp8, k=k_fp8, v=v_fp8, is_causal=causal)
-        torch.xpu.synchronize()
+    # The binding runs on its own compat queue, so both of Torch's pending
+    # writes and the kernel's writes need an explicit fence.
+    torch.xpu.synchronize()
+    output = prefill_fp8_e4m3_bshd(q=q_fp8, k=k_fp8, v=v_fp8, is_causal=causal)
+    torch.xpu.synchronize()
 
     # The binding hands back a private bf16 buffer, so rescale it in place.
     return output.div_(v_scale).to(out_dtype)
@@ -461,32 +447,30 @@ def _mxfp8_flash_attn_sycl_tla(
             f"kv_cache_dtype='{SYCL_TLA_MXFP8_LABEL}' only supports float8_e4m3fn, got {fp8_dtype}"
         )
 
-    with device_op_timer("xpu.fp8_mha.quantize_qkv"):
-        alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
-        scaled_query = query if alpha == 1.0 else query * alpha
+    alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
+    scaled_query = query if alpha == 1.0 else query * alpha
 
-        # Q/K group along the head dim; V groups along the sequence, because the
-        # kernel indexes V as (head_size_vo, seq_len_kv).
-        q_fp8, q_exp = _mx_quantize(scaled_query, 3)
-        k_fp8, k_exp = _mx_quantize(key, 3)
-        v_fp8, v_exp = _mx_quantize(value, 1)
+    # Q/K group along the head dim; V groups along the sequence, because the
+    # kernel indexes V as (head_size_vo, seq_len_kv).
+    q_fp8, q_exp = _mx_quantize(scaled_query, 3)
+    k_fp8, k_exp = _mx_quantize(key, 3)
+    v_fp8, v_exp = _mx_quantize(value, 1)
 
-        # Q/K exponents are [B, S, H, D/32], V's are [B, S/32, H, D]; both
-        # become the kernel's [B, H, groups, rows].
-        scale_q = q_exp.permute(0, 2, 3, 1).contiguous()
-        scale_k = k_exp.permute(0, 2, 3, 1).contiguous()
-        scale_v = v_exp.permute(0, 2, 1, 3).contiguous()
+    # Q/K exponents are [B, S, H, D/32], V's are [B, S/32, H, D]; both
+    # become the kernel's [B, H, groups, rows].
+    scale_q = q_exp.permute(0, 2, 3, 1).contiguous()
+    scale_k = k_exp.permute(0, 2, 3, 1).contiguous()
+    scale_v = v_exp.permute(0, 2, 1, 3).contiguous()
 
-    with device_op_timer("xpu.fp8_mha.attn_kernel"):
-        # The binding runs on its own compat queue, so both of Torch's pending
-        # writes and the kernel's writes need an explicit fence.
-        torch.xpu.synchronize()
-        output = prefill_mxfp8_e4m3_bshd(
-            q=q_fp8, k=k_fp8, v=v_fp8,
-            scale_q=scale_q, scale_k=scale_k, scale_v=scale_v,
-            is_causal=causal,
-        )
-        torch.xpu.synchronize()
+    # The binding runs on its own compat queue, so both of Torch's pending
+    # writes and the kernel's writes need an explicit fence.
+    torch.xpu.synchronize()
+    output = prefill_mxfp8_e4m3_bshd(
+        q=q_fp8, k=k_fp8, v=v_fp8,
+        scale_q=scale_q, scale_k=scale_k, scale_v=scale_v,
+        is_causal=causal,
+    )
+    torch.xpu.synchronize()
 
     return output.to(out_dtype)
 
