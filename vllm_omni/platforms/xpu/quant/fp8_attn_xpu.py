@@ -17,6 +17,13 @@ flash-attention kernel. Two kernel providers are supported, selected by the
 * ``"mxfp8_sycl_tla"`` -> the same binding's block-scaled entry point, which
   takes UE8M0 scale factors covering 32 elements each, so per-tensor descales
   are unnecessary and only the softmax scale has to be compensated.
+* ``"e4m3qk_bf16v_sycl_tla"`` -> the same binding's mixed-precision entry point:
+  E4M3 Q/K with per-tensor descale scalars folded into the softmax scale, and V
+  left in BF16 so the P@V GEMM keeps full precision.
+
+All providers first get SageAttention-style K/V sequence-mean smoothing (see
+``_smooth_kv``), which removes the channel-mean outliers that otherwise consume
+most of the FP8 range.
 """
 
 from __future__ import annotations
@@ -34,6 +41,8 @@ logger = init_logger(__name__)
 
 # Set to 1/true/yes/on to log per-call attention and quantization device times.
 ATTN_TIMING_ENV = "VLLM_OMNI_XPU_ATTN_TIMING"
+# Set to 0/false to disable SageAttention-style K/V sequence-mean smoothing.
+SMOOTH_KV_ENV = "VLLM_OMNI_XPU_ATTN_SMOOTH_KV"
 
 
 def _attn_timing_enabled() -> bool:
@@ -71,18 +80,25 @@ _XPU_KERNELS_OUT_DTYPES = (torch.float16, torch.bfloat16)
 SYCL_TLA_FP8_LABEL = "fp8_sycl_tla"
 # Same binding, block-scaled (MX) variant with per-32-element UE8M0 scales.
 SYCL_TLA_MXFP8_LABEL = "mxfp8_sycl_tla"
+# Same binding, E4M3 Q/K with per-tensor scales and BF16 V.
+SYCL_TLA_E4M3QK_BF16V_LABEL = "e4m3qk_bf16v_sycl_tla"
 # Directory holding the built ``sycl_tla_fmha`` extension, if not on PYTHONPATH.
 SYCL_TLA_PATH_ENV = "VLLM_OMNI_SYCL_TLA_FMHA_PATH"
 _SYCL_TLA_HEAD_DIM = 128
 _FP8_E4M3_MAX = 448.0
 
-# MX block size and the e4m3 shared-exponent target (448 = 1.75 * 2^8).
+# MX block size and E4M3 shared-exponent encoding.
 _MX_GROUP_SIZE = 32
-_MX_E4M3_EMAX = 8.0
 _UE8M0_BIAS = 127
 
 _FP8_KV_LABELS = frozenset(
-    {"fp8", XPU_KERNELS_FP8_LABEL, SYCL_TLA_FP8_LABEL, SYCL_TLA_MXFP8_LABEL}
+    {
+        "fp8",
+        XPU_KERNELS_FP8_LABEL,
+        SYCL_TLA_FP8_LABEL,
+        SYCL_TLA_MXFP8_LABEL,
+        SYCL_TLA_E4M3QK_BF16V_LABEL,
+    }
 )
 
 
@@ -172,6 +188,23 @@ def _load_sycl_tla_mxfp8_func():
         module.__file__,
     )
     return module.prefill_mxfp8_e4m3_bshd
+
+
+@torch._dynamo.disable
+@lru_cache(maxsize=1)
+def _load_sycl_tla_e4m3qk_bf16v_func():
+    module = _import_sycl_tla_fmha(SYCL_TLA_E4M3QK_BF16V_LABEL)
+    if not hasattr(module, "prefill_e4m3qk_bf16v_bshd"):
+        raise ImportError(
+            f"kv_cache_dtype='{SYCL_TLA_E4M3QK_BF16V_LABEL}' requires a sycl_tla_fmha build that "
+            f"exports prefill_e4m3qk_bf16v_bshd; rebuild the extension from {module.__file__}"
+        )
+    logger.info(
+        "SYCL-TLA E4M3 QK / BF16 PV flash-attention enabled (kv_cache_dtype='%s') from %s",
+        SYCL_TLA_E4M3QK_BF16V_LABEL,
+        module.__file__,
+    )
+    return module.prefill_e4m3qk_bf16v_bshd
 
 
 def _quantize_per_tensor(tensor: torch.Tensor, fp8_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
@@ -306,6 +339,44 @@ def _abs_amax(tensor: torch.Tensor) -> torch.Tensor:
     return torch.maximum(tensor.amax().abs(), tensor.amin().abs()).float()
 
 
+def _smooth_kv_enabled() -> bool:
+    return os.environ.get(SMOOTH_KV_ENV, "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _smooth_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    smooth_v: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Subtract the per-channel sequence mean from K, and optionally from V.
+
+    K/V channel means are the dominant outliers in DiT attention: they consume
+    most of the FP8 range while carrying no information that survives softmax.
+    Both corrections are exact, so neither needs kernel support.
+
+    * K: dropping ``mu_K`` subtracts ``q_i . mu_K`` from every logit in row
+      ``i``, and softmax is invariant to a per-row constant.
+    * V: attention rows sum to one, so the output shifts by exactly ``mu_V``;
+      it is returned for the caller to add back.
+
+    Q cannot be smoothed this way -- ``mu_Q . k_j`` varies along the key axis,
+    so it needs the ``mu_Q @ K_s^T`` logit correction fused into the kernel.
+    """
+    if not _smooth_kv_enabled():
+        return key, value, None
+
+    with _attn_timer("K/V sequence-mean smoothing"):
+        # The means are accumulated in fp32; the subtraction itself stays in the
+        # input dtype, whose rounding is an order of magnitude below e4m3's.
+        key = key - key.mean(dim=1, keepdim=True, dtype=torch.float32).to(key.dtype)
+        v_mean = None
+        if smooth_v:
+            v_mean = value.mean(dim=1, keepdim=True, dtype=torch.float32).to(value.dtype)
+            value = value - v_mean
+    return key, value, v_mean
+
+
 def _scale_to_fp8(tensor: torch.Tensor, scale: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
     # e4m3fn has no infinities: PyTorch maps out-of-range inputs to NaN, so clamp first.
     # copy=True is required: .to() is a no-op for an fp32 input, and mul_ would
@@ -357,7 +428,7 @@ def _fp8_flash_attn_sycl_tla(
         v_amax = _abs_amax(value).clamp_(min=_MIN_DESCALE)
 
         q_scale = torch.sqrt(alpha * k_amax / q_amax)
-        v_scale = FP8_QUANT_RANGE / v_amax
+        v_scale = _FP8_E4M3_MAX / v_amax
 
         q_fp8 = _scale_to_fp8(query, q_scale, fp8_dtype)
         k_fp8 = _scale_to_fp8(key, alpha / q_scale, fp8_dtype)
@@ -389,8 +460,11 @@ def _mx_group_amax_head_dim(tensor: torch.Tensor) -> torch.Tensor:
 def _mx_exponent_from_amax(amax: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     if scale != 1.0:
         amax = amax.mul_(scale)
-    exponent = torch.floor(torch.log2(amax.clamp_min(torch.finfo(torch.float32).tiny)))
-    return (exponent - _MX_E4M3_EMAX).clamp(-_UE8M0_BIAS, _UE8M0_BIAS)
+    amax = amax.clamp_min(torch.finfo(torch.float32).tiny)
+    # A floor(log2(amax)) - 8 scale maps maxima as high as 512 into E4M3,
+    # whose finite limit is 448, clipping the largest values in many blocks.
+    exponent = torch.ceil(torch.log2(amax / _FP8_E4M3_MAX))
+    return exponent.clamp(-_UE8M0_BIAS, _UE8M0_BIAS)
 
 
 def _mx_exponent(blocked: torch.Tensor, reduce_dim: int, scale: float = 1.0) -> torch.Tensor:
@@ -403,13 +477,14 @@ def _mx_apply(blocked: torch.Tensor, exponent: torch.Tensor, scale: float = 1.0)
     factor = torch.exp2(exponent.neg())
     if scale != 1.0:
         factor = factor.mul_(scale)
-    # The block descale is a power of two, so applying it in the input dtype is
-    # exact and avoids a full-size fp32 temporary.
-    return (
-        torch.mul(blocked, factor.to(blocked.dtype))
-        .clamp_(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-        .to(torch.float8_e4m3fn)
-    )
+    if blocked.dtype == torch.float16:
+        # Large reciprocal UE8M0 scales overflow FP16 before multiplication;
+        # in particular, an all-zero block would become 0 * inf = NaN.
+        scaled = torch.mul(blocked.float(), factor)
+    else:
+        # Power-of-two block scales are exact in BF16 and avoid an fp32 copy.
+        scaled = torch.mul(blocked, factor.to(blocked.dtype))
+    return scaled.clamp_(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
 
 
 # Intel's Triton backend fails to lower the fused MX quantization kernel
@@ -531,10 +606,68 @@ def _mxfp8_flash_attn_sycl_tla(
     return output.to(out_dtype)
 
 
+def _e4m3qk_bf16v_flash_attn_sycl_tla(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    """Run the SYCL-TLA ``sycl_tla_fmha`` E4M3 QK / BF16 PV prefill kernel.
+
+    Only the Q@K GEMM is quantized: the binding takes per-tensor descale
+    scalars for Q and K and folds their product into the softmax scale, while V
+    stays BF16 so the P@V GEMM and the output need no rescaling. The kernel's
+    fixed ``1/sqrt(head_dim)`` softmax scale is compensated by scaling the Q
+    descale, which is exact because the descale is applied to the logits.
+    """
+    prefill_e4m3qk_bf16v_bshd = _load_sycl_tla_e4m3qk_bf16v_func()
+
+    head_dim = query.shape[-1]
+    out_dtype = query.dtype
+    if head_dim != _SYCL_TLA_HEAD_DIM:
+        raise ValueError(
+            f"kv_cache_dtype='{SYCL_TLA_E4M3QK_BF16V_LABEL}' only supports head_dim "
+            f"{_SYCL_TLA_HEAD_DIM}, got {head_dim}"
+        )
+    if fp8_dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"kv_cache_dtype='{SYCL_TLA_E4M3QK_BF16V_LABEL}' only supports float8_e4m3fn, "
+            f"got {fp8_dtype}"
+        )
+
+    with _attn_timer("SYCL-TLA E4M3 QK / BF16 PV attention quantization"):
+        alpha = (softmax_scale if softmax_scale is not None else head_dim**-0.5) * math.sqrt(head_dim)
+        q_amax = _abs_amax(query).clamp_(min=_MIN_DESCALE)
+        k_amax = _abs_amax(key).clamp_(min=_MIN_DESCALE)
+
+        q_fp8 = _scale_to_fp8(query, _FP8_E4M3_MAX / q_amax, fp8_dtype)
+        k_fp8 = _scale_to_fp8(key, _FP8_E4M3_MAX / k_amax, fp8_dtype)
+        # The binding takes Python floats, so these force a device sync.
+        scale_q = (q_amax / _FP8_E4M3_MAX).item() * alpha
+        scale_k = (k_amax / _FP8_E4M3_MAX).item()
+        v_bf16 = value.to(torch.bfloat16)
+
+    # The binding runs on its own compat queue, so both of Torch's pending
+    # writes and the kernel's writes need an explicit fence.
+    torch.xpu.synchronize()
+    with _attn_timer("SYCL-TLA E4M3 QK / BF16 PV attention"):
+        output = prefill_e4m3qk_bf16v_bshd(
+            q=q_fp8, k=k_fp8, v=v_bf16,
+            scale_q=scale_q, scale_k=scale_k,
+            is_causal=causal,
+        )
+
+    return output.to(out_dtype)
+
+
 _FP8_IMPLS = {
     XPU_KERNELS_FP8_LABEL: _fp8_flash_attn_varlen_xpu_kernels,
     SYCL_TLA_FP8_LABEL: _fp8_flash_attn_sycl_tla,
     SYCL_TLA_MXFP8_LABEL: _mxfp8_flash_attn_sycl_tla,
+    SYCL_TLA_E4M3QK_BF16V_LABEL: _e4m3qk_bf16v_flash_attn_sycl_tla,
 }
 
 
@@ -560,7 +693,9 @@ def fp8_flash_attn_varlen_xpu(
         raise ValueError("fp8_flash_attn_varlen_xpu requires matching batch sizes for Q/K/V")
 
     impl = _FP8_IMPLS.get(kv_cache_dtype, _fp8_flash_attn_varlen_deepklox)
-    return impl(
+    # Smoothing V only pays off where V is quantized.
+    key, value, v_mean = _smooth_kv(key, value, smooth_v=kv_cache_dtype != SYCL_TLA_E4M3QK_BF16V_LABEL)
+    output = impl(
         query,
         key,
         value,
@@ -568,3 +703,6 @@ def fp8_flash_attn_varlen_xpu(
         causal=causal,
         fp8_dtype=fp8_dtype,
     )
+    if v_mean is not None:
+        output = output.add_(v_mean.to(output.dtype))
+    return output
